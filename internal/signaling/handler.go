@@ -17,15 +17,38 @@ type Handler struct {
 	connectionManager    *ConnectionManager
 	peerConnections      map[string]*webrtc.PeerConnection
 	peerConnectionsMutex sync.RWMutex
+	// peerConnectionConfig is used for every peer connection this handler
+	// creates; it defaults to DefaultPeerConnectionConfig() and can be
+	// overridden with WithPeerConnectionConfig.
+	peerConnectionConfig webrtc.PeerConnectionConfig
+}
+
+// HandlerOption customises a Handler at construction time.
+type HandlerOption func(*Handler)
+
+// WithPeerConnectionConfig sets the configuration used for every peer
+// connection created by the handler (join and reconnect paths alike). Use a
+// STUN-free config in tests to keep negotiation deterministic and offline.
+func WithPeerConnectionConfig(config webrtc.PeerConnectionConfig) HandlerOption {
+	return func(h *Handler) {
+		h.peerConnectionConfig = config
+	}
 }
 
 // NewHandler creates a new Handler.
-func NewHandler(roomManager *RoomManager) *Handler {
-	return &Handler{
-		roomManager:       roomManager,
-		connectionManager: NewConnectionManager(),
-		peerConnections:   make(map[string]*webrtc.PeerConnection),
+func NewHandler(roomManager *RoomManager, opts ...HandlerOption) *Handler {
+	h := &Handler{
+		roomManager:          roomManager,
+		connectionManager:    NewConnectionManager(),
+		peerConnections:      make(map[string]*webrtc.PeerConnection),
+		peerConnectionConfig: webrtc.DefaultPeerConnectionConfig(),
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(h)
+		}
+	}
+	return h
 }
 
 // ServeHTTP implements http.Handler for WebSocket connections.
@@ -47,9 +70,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Register the connection
+	// Register the connection. It stays registered for the whole lifetime of
+	// the session: broadcasts to other room members are delivered through
+	// this registry, so removal must happen on the handleConnection cleanup
+	// path, not when ServeHTTP returns (it returns immediately after
+	// spawning the goroutine).
 	h.connectionManager.Add(conn)
-	defer h.connectionManager.Remove(conn.ID())
 
 	// Handle the connection in a goroutine
 	go h.handleConnection(conn)
@@ -58,6 +84,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // handleConnection handles messages from a single connection.
 func (h *Handler) handleConnection(conn *Connection) {
 	defer conn.Close()
+
+	// Deregister the connection when its lifecycle ends (i.e. when this
+	// goroutine returns, after the cleanup below has run). Removing here —
+	// and not when ServeHTTP returns — keeps the registry populated so
+	// broadcasts reach room members. RemoveIf leaves a newer connection
+	// registered if a reconnecting participant already replaced this one.
+	defer h.connectionManager.RemoveIf(conn.ID(), conn)
 
 	// Get or create the room
 	room, err := h.roomManager.GetOrCreateRoom(conn.RoomID())
@@ -69,6 +102,13 @@ func (h *Handler) handleConnection(conn *Connection) {
 			RequestType: string(MessageTypeJoinRoom),
 		})
 		return
+	}
+
+	// Signaling sender bound to this WebSocket connection; it is handed to
+	// (or swapped onto) the participant's peer connection below so that
+	// negotiation and ICE events flow over the newest transport.
+	sender := func(msgType string, data interface{}) error {
+		return conn.Send(MessageType(msgType), data)
 	}
 
 	// Get or create the participant
@@ -88,11 +128,7 @@ func (h *Handler) handleConnection(conn *Connection) {
 		participant.SetRoom(room)
 
 		// Initialize a peer connection for the participant
-		pcConfig := webrtc.DefaultPeerConnectionConfig()
-		pc, err := webrtc.NewPeerConnection(pcConfig, participant, func(msgType string, data interface{}) error {
-			return conn.Send(MessageType(msgType), data)
-		})
-		if err != nil {
+		if _, err := h.ensurePeerConnection(participant, sender); err != nil {
 			log.Printf("Failed to create peer connection: %v", err)
 			_ = conn.Send(MessageTypeError, ErrorResponse{
 				Error:       "Failed to create peer connection",
@@ -102,43 +138,16 @@ func (h *Handler) handleConnection(conn *Connection) {
 			return
 		}
 
-		h.peerConnectionsMutex.Lock()
-		h.peerConnections[participant.ID()] = pc
-		h.peerConnectionsMutex.Unlock()
-
 		// Notify other participants that a new participant has joined
 		h.broadcastParticipantJoined(room, participant)
 	} else {
 		// Reconnect existing participant
 		participant.SetRoom(room)
 
-		// Reuse the existing peer connection or create a new one if needed
-		h.peerConnectionsMutex.RLock()
-		pc := h.peerConnections[participant.ID()]
-		h.peerConnectionsMutex.RUnlock()
-
-		if pc != nil {
-			// Update the signaling sender to use the new connection
-			pc.UpdateSignalingSender(func(msgType string, data interface{}) error {
-				return conn.Send(MessageType(msgType), data)
-			})
-			if pc.NeedsReconnect() {
-				log.Printf("signaling: reconnecting participant=%s state=%s",
-					participant.ID(), pc.State())
-			}
-		} else {
-			pcConfig := webrtc.DefaultPeerConnectionConfig()
-			newPC, err := webrtc.NewPeerConnection(pcConfig, participant, func(msgType string, data interface{}) error {
-				return conn.Send(MessageType(msgType), data)
-			})
-			if err != nil {
-				log.Printf("Failed to recreate peer connection on reconnect: %v", err)
-			} else {
-				h.peerConnectionsMutex.Lock()
-				h.peerConnections[participant.ID()] = newPC
-				h.peerConnectionsMutex.Unlock()
-				log.Printf("signaling: recreated peer connection for participant=%s", participant.ID())
-			}
+		// Reuse the existing peer connection or replace it when unusable;
+		// either way its signaling output follows the new connection.
+		if _, err := h.ensurePeerConnection(participant, sender); err != nil {
+			log.Printf("Failed to recreate peer connection on reconnect: %v", err)
 		}
 	}
 
@@ -164,7 +173,7 @@ func (h *Handler) handleConnection(conn *Connection) {
 			log.Printf("Failed to handle message: %v", err)
 			_ = conn.Send(MessageTypeError, ErrorResponse{
 				Error:       err.Error(),
-				Code:        ErrorCodeInternalError,
+				Code:        errorCodeFromDomainError(err),
 				RequestType: string(msg.Type),
 			})
 		}
@@ -172,6 +181,44 @@ func (h *Handler) handleConnection(conn *Connection) {
 
 	// Clean up when connection closes
 	h.handleConnectionClosed(room, participant)
+}
+
+// ensurePeerConnection returns the peer connection for the given participant,
+// creating or replacing it as necessary.
+//
+//   - When a usable peer connection already exists it is reused as-is; only
+//     its signaling sender is swapped so events follow the newest WebSocket.
+//   - When the existing connection is Closed or Failed it can no longer carry
+//     media: it is closed for good and replaced by a fresh one created with
+//     the handler's configured PeerConnectionConfig.
+func (h *Handler) ensurePeerConnection(participant *domain.Participant, sender webrtc.SignalingSender) (*webrtc.PeerConnection, error) {
+	h.peerConnectionsMutex.RLock()
+	existing := h.peerConnections[participant.ID()]
+	h.peerConnectionsMutex.RUnlock()
+
+	if existing != nil &&
+		existing.State() != webrtc.PeerConnectionStateClosed &&
+		existing.State() != webrtc.PeerConnectionStateFailed {
+		// Update the signaling sender to use the new connection
+		existing.UpdateSignalingSender(sender)
+		return existing, nil
+	}
+
+	pc, err := webrtc.NewPeerConnection(h.peerConnectionConfig, participant, sender)
+	if err != nil {
+		return nil, err
+	}
+
+	if existing != nil {
+		// Best effort: the old connection is already unusable.
+		_ = existing.Close()
+	}
+
+	h.peerConnectionsMutex.Lock()
+	h.peerConnections[participant.ID()] = pc
+	h.peerConnectionsMutex.Unlock()
+
+	return pc, nil
 }
 
 // handleMessage handles a single message from a connection.
@@ -314,6 +361,13 @@ func (h *Handler) handlePublishTrack(conn *Connection, room *domain.Room, partic
 		return err
 	}
 
+	// Register the track in the room-wide registry so that subscribers can
+	// resolve it through the room instead of reaching into the publisher.
+	// Re-publishing after a reconnect is tolerated as idempotent.
+	if err := room.PublishTrack(track); err != nil && err != domain.ErrTrackAlreadyPublished {
+		return err
+	}
+
 	// Send response
 	resp := TrackPublishedResponse{
 		TrackID:       req.Track.ID,
@@ -343,6 +397,12 @@ func (h *Handler) handleUnpublishTrack(conn *Connection, room *domain.Room, part
 		return err
 	}
 
+	// Keep the room registry coherent with the participant's publication
+	// state; an entry that is already gone is tolerated as idempotent.
+	if err := room.UnpublishTrack(req.TrackID); err != nil && err != domain.ErrTrackNotFound {
+		return err
+	}
+
 	// Send response
 	resp := TrackUnpublishedResponse{
 		TrackID:       req.TrackID,
@@ -367,19 +427,11 @@ func (h *Handler) handleSubscribeTrack(conn *Connection, room *domain.Room, part
 		return err
 	}
 
-	// Find the track from the publisher
-	publisher := room.GetParticipant(req.ParticipantID)
-	if publisher == nil {
-		return domain.ErrParticipantNotFound
-	}
-
-	track := publisher.GetPublishedTrack(req.TrackID)
-	if track == nil {
-		return domain.ErrTrackNotFound
-	}
-
-	// Subscribe to the track
-	if err := participant.SubscribeTrack(track); err != nil {
+	// Subscribe through the room registry: the room owns track lookup and
+	// keeps subscriber bookkeeping consistent for the whole room. Domain
+	// errors (unknown track, closed room, ...) are mapped to error codes by
+	// the generic message loop.
+	if err := room.SubscribeToTrack(participant, req.TrackID); err != nil {
 		return err
 	}
 

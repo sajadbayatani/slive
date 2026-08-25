@@ -10,13 +10,13 @@ import (
 func TestNewICECandidate(t *testing.T) {
 	// Create a Pion ICE candidate
 	pionCandidate := &webrtc.ICECandidate{
-		Foundation:     "1234567890",
-		Priority:       2122260223,
-		Address:        "192.168.1.1",
-		Protocol:       webrtc.ICEProtocolUDP,
-		Port:           12345,
-		Typ:            webrtc.ICECandidateTypeHost,
-		Component:      1,
+		Foundation: "1234567890",
+		Priority:   2122260223,
+		Address:    "192.168.1.1",
+		Protocol:   webrtc.ICEProtocolUDP,
+		Port:       12345,
+		Typ:        webrtc.ICECandidateTypeHost,
+		Component:  1,
 	}
 
 	// Create an ICECandidate
@@ -58,13 +58,13 @@ func TestNewICECandidateFromString(t *testing.T) {
 
 func TestICECandidateSetters(t *testing.T) {
 	pionCandidate := &webrtc.ICECandidate{
-		Foundation:     "1234567890",
-		Priority:       2122260223,
-		Address:        "192.168.1.1",
-		Protocol:       webrtc.ICEProtocolUDP,
-		Port:           12345,
-		Typ:            webrtc.ICECandidateTypeHost,
-		Component:      1,
+		Foundation: "1234567890",
+		Priority:   2122260223,
+		Address:    "192.168.1.1",
+		Protocol:   webrtc.ICEProtocolUDP,
+		Port:       12345,
+		Typ:        webrtc.ICECandidateTypeHost,
+		Component:  1,
 	}
 
 	candidate := NewICECandidate(pionCandidate)
@@ -93,13 +93,13 @@ func TestICECandidateSetters(t *testing.T) {
 
 func TestICECandidateMarshalJSON(t *testing.T) {
 	pionCandidate := &webrtc.ICECandidate{
-		Foundation:     "1234567890",
-		Priority:       2122260223,
-		Address:        "192.168.1.1",
-		Protocol:       webrtc.ICEProtocolUDP,
-		Port:           12345,
-		Typ:            webrtc.ICECandidateTypeHost,
-		Component:      1,
+		Foundation: "1234567890",
+		Priority:   2122260223,
+		Address:    "192.168.1.1",
+		Protocol:   webrtc.ICEProtocolUDP,
+		Port:       12345,
+		Typ:        webrtc.ICECandidateTypeHost,
+		Component:  1,
 	}
 
 	candidate := NewICECandidate(pionCandidate)
@@ -149,13 +149,13 @@ func TestICECandidateUnmarshalJSON(t *testing.T) {
 
 func TestICECandidateString(t *testing.T) {
 	pionCandidate := &webrtc.ICECandidate{
-		Foundation:     "1234567890",
-		Priority:       2122260223,
-		Address:        "192.168.1.1",
-		Protocol:       webrtc.ICEProtocolUDP,
-		Port:           12345,
-		Typ:            webrtc.ICECandidateTypeHost,
-		Component:      1,
+		Foundation: "1234567890",
+		Priority:   2122260223,
+		Address:    "192.168.1.1",
+		Protocol:   webrtc.ICEProtocolUDP,
+		Port:       12345,
+		Typ:        webrtc.ICECandidateTypeHost,
+		Component:  1,
 	}
 
 	candidate := NewICECandidate(pionCandidate)

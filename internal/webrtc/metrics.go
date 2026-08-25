@@ -4,8 +4,8 @@ import "sync/atomic"
 
 // ConnectionMetrics tracks WebRTC connection attempt and failure counters.
 type connectionMetrics struct {
-	attempts  atomic.Uint64
-	failures  atomic.Uint64
+	attempts atomic.Uint64
+	failures atomic.Uint64
 }
 
 // ConnectionMetrics is the package-level metrics registry for peer connections.

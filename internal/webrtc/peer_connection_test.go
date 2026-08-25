@@ -367,7 +367,7 @@ func TestWebRTCTrackKindConversion(t *testing.T) {
 
 func TestWebRTCTrackSourceConversion(t *testing.T) {
 	tests := []struct {
-		webrtcKind webrtc.RTPCodecType
+		webrtcKind   webrtc.RTPCodecType
 		domainSource domain.TrackSource
 	}{
 		{webrtc.RTPCodecTypeAudio, domain.TrackSourceMicrophone},

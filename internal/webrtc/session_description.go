@@ -10,9 +10,9 @@ import (
 // SessionDescription represents a WebRTC session description (SDP offer/answer).
 // It provides thread-safe access to the underlying Pion WebRTC session description.
 type SessionDescription struct {
-	mu     sync.RWMutex
-	sdp    *webrtc.SessionDescription
-	type_  webrtc.SDPType
+	mu    sync.RWMutex
+	sdp   *webrtc.SessionDescription
+	type_ webrtc.SDPType
 }
 
 // NewSessionDescription creates a new SessionDescription from a Pion WebRTC session description.
@@ -27,8 +27,8 @@ func NewSessionDescription(sdp *webrtc.SessionDescription) *SessionDescription {
 func NewSessionDescriptionFromString(sdp string, sdpType webrtc.SDPType) (*SessionDescription, error) {
 	return &SessionDescription{
 		sdp: &webrtc.SessionDescription{
-			Type:  sdpType,
-			SDP:   sdp,
+			Type: sdpType,
+			SDP:  sdp,
 		},
 		type_: sdpType,
 	}, nil

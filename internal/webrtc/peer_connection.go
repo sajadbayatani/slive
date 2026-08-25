@@ -67,19 +67,22 @@ type SignalingSender func(msgType string, data interface{}) error
 // PeerConnection manages a WebRTC peer connection.
 // It provides thread-safe access to the underlying Pion WebRTC peer connection.
 type PeerConnection struct {
-	mu              sync.RWMutex
-	pionPC          *webrtc.PeerConnection
-	config          PeerConnectionConfig
-	state           PeerConnectionState
-	localTracks     map[string]*WebRTCTrack
-	remoteTracks    map[string]*WebRTCTrack
-	participant     *domain.Participant
-	sendSignaling   SignalingSender
-	onNegotiation   bool
-	onICECandidate  bool
-	onTrack         bool
-	ctx             context.Context
-	cancel          context.CancelFunc
+	mu            sync.RWMutex
+	pionPC        *webrtc.PeerConnection
+	config        PeerConnectionConfig
+	state         PeerConnectionState
+	localTracks   map[string]*WebRTCTrack
+	remoteTracks  map[string]*WebRTCTrack
+	participant   *domain.Participant
+	sendSignaling SignalingSender
+	// Event callbacks registered via OnNegotiationNeeded / OnICECandidate /
+	// OnTrack. They are stored on the struct and invoked from the pion event
+	// handlers below; a nil callback simply means "not interested".
+	onNegotiationNeeded func()
+	onICECandidate      func(*ICECandidate)
+	onTrack             func(*WebRTCTrack)
+	ctx                 context.Context
+	cancel              context.CancelFunc
 }
 
 // NewPeerConnection creates a new PeerConnection with the given configuration.
@@ -383,76 +386,100 @@ func (pc *PeerConnection) Close() error {
 	return nil
 }
 
-// OnNegotiationNeeded registers a callback for when negotiation is needed.
+// OnNegotiationNeeded registers a callback invoked whenever the underlying
+// peer connection signals that renegotiation is needed. Registering a
+// callback does not disable the automatic offer push performed when a
+// signaling sender is configured (see handleNegotiationNeeded). Passing nil
+// clears a previously registered callback.
 func (pc *PeerConnection) OnNegotiationNeeded(callback func()) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
-	pc.onNegotiation = true
-	// Note: The actual callback is set in NewPeerConnection
-	// This method is for external registration
-	_ = callback
+	pc.onNegotiationNeeded = callback
 }
 
-// OnICECandidate registers a callback for when an ICE candidate is generated.
+// OnICECandidate registers a callback invoked for every local ICE candidate
+// produced during gathering. The trailing nil sentinel emitted at the end of
+// gathering by the WebRTC spec is not forwarded. Passing nil clears a
+// previously registered callback.
 func (pc *PeerConnection) OnICECandidate(callback func(*ICECandidate)) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
-	pc.onICECandidate = true
-	// Note: The actual callback is set in NewPeerConnection
-	_ = callback
+	pc.onICECandidate = callback
 }
 
-// OnTrack registers a callback for when a remote track is added.
+// OnTrack registers a callback invoked when the remote peer starts streaming
+// a media track towards us. The wrapper WebRTCTrack passed to the callback is
+// the same instance stored in the remote-track registry. Passing nil clears a
+// previously registered callback.
 func (pc *PeerConnection) OnTrack(callback func(*WebRTCTrack)) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
-	pc.onTrack = true
-	// Note: The actual callback is set in NewPeerConnection
-	_ = callback
+	pc.onTrack = callback
 }
 
 // handleNegotiationNeeded is called when the peer connection needs to renegotiate.
+// It invokes a registered callback (asynchronously, so user code never runs on
+// pion's dispatch goroutine) and, when a signaling sender is configured,
+// automatically creates an offer and pushes it over the signaling channel.
 func (pc *PeerConnection) handleNegotiationNeeded() {
-	pc.mu.Lock()
-	if pc.onNegotiation && pc.sendSignaling != nil {
-		pc.mu.Unlock()
-		// Trigger offer creation and send via signaling
-		go func() {
-			offer, err := pc.CreateOffer()
-			if err != nil {
-				return
-			}
-			// Send the offer via signaling
-			_ = pc.sendSignaling("webrtc:offer", offer)
-		}()
-		pc.mu.Lock()
-		pc.state = PeerConnectionStateConnecting
+	pc.mu.RLock()
+	callback := pc.onNegotiationNeeded
+	sendSignaling := pc.sendSignaling
+	pc.mu.RUnlock()
+
+	if callback != nil {
+		go callback()
 	}
-	pc.mu.Unlock()
+
+	if sendSignaling == nil {
+		return
+	}
+
+	go func() {
+		offer, err := pc.CreateOffer()
+		if err != nil {
+			return
+		}
+		_ = sendSignaling("webrtc:offer", offer)
+	}()
 }
 
 // handleICECandidate is called when a new ICE candidate is generated.
 func (pc *PeerConnection) handleICECandidate(candidate *webrtc.ICECandidate) {
-	pc.mu.Lock()
+	if candidate == nil {
+		// Gathering-complete sentinel; nothing to forward.
+		return
+	}
+
+	pc.dispatchICECandidate(NewICECandidate(candidate))
+}
+
+// dispatchICECandidate fans a gathered local candidate out to the registered
+// callback and the configured signaling sender.
+func (pc *PeerConnection) dispatchICECandidate(wrapped *ICECandidate) {
+	pc.mu.RLock()
+	callback := pc.onICECandidate
 	sendSignaling := pc.sendSignaling
-	pc.mu.Unlock()
-	
-	if candidate != nil && sendSignaling != nil {
+	pc.mu.RUnlock()
+
+	if callback != nil {
+		callback(wrapped)
+	}
+
+	if sendSignaling != nil {
 		// Send the ICE candidate via signaling
-		iceCandidate := NewICECandidate(candidate)
-		_ = sendSignaling("webrtc:ice-candidate", iceCandidate)
+		_ = sendSignaling("webrtc:ice-candidate", wrapped)
 	}
 }
 
 // handleTrack is called when a new remote track is added.
 func (pc *PeerConnection) handleTrack(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
+	_ = receiver
 
 	// Create a domain track for the remote track
 	kind := webrtcTrackKindToDomain(track.Kind())
 	source := webrtcTrackSource(track.Kind())
-	
+
 	domainTrack, err := domain.NewTrack(track.ID(), kind, source)
 	if err != nil {
 		// Log error but continue
@@ -462,12 +489,15 @@ func (pc *PeerConnection) handleTrack(track *webrtc.TrackRemote, receiver *webrt
 	// Create a WebRTCTrack wrapper
 	webRTCTrack := NewWebRTCTrack(domainTrack, track, track.Codec())
 
-	// Store the remote track
+	pc.mu.Lock()
 	pc.remoteTracks[track.ID()] = webRTCTrack
+	callback := pc.onTrack
+	pc.mu.Unlock()
 
-	if pc.onTrack {
-		// In a real implementation, this would notify the application
-		// For now, we just store the track
+	// Invoke outside the lock so callbacks may re-enter PeerConnection
+	// methods without deadlocking.
+	if callback != nil {
+		callback(webRTCTrack)
 	}
 }
 

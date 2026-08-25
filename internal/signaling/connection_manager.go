@@ -33,6 +33,21 @@ func (cm *ConnectionManager) Remove(connID string) {
 	delete(cm.connections, connID)
 }
 
+// RemoveIf removes the connection stored under participantID only when it is
+// still the exact connection instance passed in. It makes cleanup safe when a
+// reconnecting participant has already registered a newer connection under
+// the same ID: the stale goroutine's cleanup must not evict the fresh one.
+func (cm *ConnectionManager) RemoveIf(participantID string, conn *Connection) bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if existing, exists := cm.connections[participantID]; exists && existing == conn {
+		delete(cm.connections, participantID)
+		return true
+	}
+	return false
+}
+
 // Get retrieves a connection by participant ID.
 // Returns nil if the connection is not found.
 func (cm *ConnectionManager) Get(participantID string) *Connection {

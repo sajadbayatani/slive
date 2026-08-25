@@ -27,9 +27,9 @@ func TestNewWebRTCTrack(t *testing.T) {
 	// Create a WebRTCTrack
 	codec := webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:     webrtc.MimeTypeOpus,
-			ClockRate:    48000,
-			Channels:     2,
+			MimeType:    webrtc.MimeTypeOpus,
+			ClockRate:   48000,
+			Channels:    2,
 			SDPFmtpLine: "minptime=10;useinbandfec=1",
 		},
 		PayloadType: 111,

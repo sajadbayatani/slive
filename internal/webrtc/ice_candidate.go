@@ -10,7 +10,7 @@ import (
 // ICECandidate represents a WebRTC ICE candidate.
 // It provides thread-safe access to the underlying Pion WebRTC ICE candidate.
 type ICECandidate struct {
-	mu       sync.RWMutex
+	mu        sync.RWMutex
 	candidate webrtc.ICECandidateInit
 }
 
