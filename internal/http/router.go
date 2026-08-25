@@ -1,0 +1,71 @@
+package http
+
+import (
+	"net/http"
+
+	"github.com/sajadbayatani/slive/internal/config"
+	"github.com/sajadbayatani/slive/internal/logger"
+)
+
+// Router handles the registration of all HTTP routes.
+// It separates route registration logic from server setup.
+type Router struct {
+	mux  *http.ServeMux
+	deps HandlerDeps
+}
+
+// NewRouter creates a new Router with the provided dependencies.
+// It registers all application routes.
+func NewRouter(cfg config.Config, deps HandlerDeps) *Router {
+	mux := http.NewServeMux()
+
+	router := &Router{
+		mux:  mux,
+		deps: deps,
+	}
+
+	router.registerRoutes(cfg)
+
+	return router
+}
+
+// registerRoutes registers all application routes.
+// This method is called during router initialization.
+func (r *Router) registerRoutes(cfg config.Config) {
+	// The health path comes from runtime configuration rather than being
+	// hardcoded in the HTTP layer.
+	healthHandler := NewHealthHandler(r.deps)
+	healthPath := cfg.HealthPath
+	if healthPath == "" {
+		healthPath = config.DefaultHealthPath
+	}
+	r.mux.Handle(healthPath, healthHandler)
+}
+
+// ServeMux returns the underlying http.ServeMux for use with the HTTP server.
+func (r *Router) ServeMux() *http.ServeMux {
+	return r.mux
+}
+
+// HandlerDepsProvider is an interface for providing handler dependencies.
+// This enables easier testing and mocking.
+type HandlerDepsProvider interface {
+	GetHandlerDeps() HandlerDeps
+}
+
+// RealHandlerDepsProvider provides real handler dependencies.
+type RealHandlerDepsProvider struct {
+	log *logger.Logger
+}
+
+// NewRealHandlerDepsProvider creates a new RealHandlerDepsProvider.
+func NewRealHandlerDepsProvider(log *logger.Logger) *RealHandlerDepsProvider {
+	return &RealHandlerDepsProvider{log: log}
+}
+
+// GetHandlerDeps returns the handler dependencies.
+func (p *RealHandlerDepsProvider) GetHandlerDeps() HandlerDeps {
+	return HandlerDeps{
+		Log: p.log,
+	}
+}
