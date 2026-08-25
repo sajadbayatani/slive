@@ -99,8 +99,11 @@ func (p *Participant) Leave() {
 	p.state = ParticipantStateLeft
 	participantID := p.id
 
-	// Clean up published tracks - remove this participant as publisher
+	// Clean up published tracks: transition them out of the published state,
+	// clear publisher ownership, and drop any self-subscription remnant.
 	for trackID, track := range p.pubTracks {
+		track.Unpublish()
+		track.SetPublisher(nil)
 		track.RemoveSubscriber(participantID)
 		delete(p.pubTracks, trackID)
 	}

@@ -290,18 +290,38 @@ func TestRoomParticipantTrackIntegration(t *testing.T) {
 		t.Error("Expected track publisher to be set")
 	}
 
-	// Publisher leaves the room
-	publisher.Leave()
+	// Publisher leaves the room. Room.Leave runs first so it still sees the
+	// publication attribution and performs the canonical teardown (destroy
+	// the track, detach subscribers); Participant.Leave afterwards only
+	// clears the leaver's own bookkeeping.
 	_ = room.Leave("publisher-1")
+	publisher.Leave()
 
 	// Verify publisher's tracks are cleaned up
 	if len(publisher.PublishedTracks()) != 0 {
 		t.Errorf("Expected 0 published tracks after leaving, got %d", len(publisher.PublishedTracks()))
 	}
 
-	// Subscriber should still have the track subscribed (but it's now dangling)
-	if len(subscriber.SubscribedTracks()) != 1 {
-		t.Errorf("Expected 1 subscribed track after publisher leaves, got %d", len(subscriber.SubscribedTracks()))
+	// Canonical rule "loss of publisher destroys the track": the subscriber
+	// must be detached instead of holding a dangling subscription.
+	if len(subscriber.SubscribedTracks()) != 0 {
+		t.Errorf("Expected 0 subscribed tracks after publisher leaves (detached), got %d", len(subscriber.SubscribedTracks()))
+	}
+	if audioTrack.HasSubscribers() {
+		t.Error("Expected no subscribers on the destroyed track")
+	}
+
+	// The room registry must no longer list the orphaned track.
+	if len(room.Tracks()) != 0 {
+		t.Errorf("Expected empty room track registry after publisher leaves, got %d", len(room.Tracks()))
+	}
+
+	// The track object itself must reflect its destruction.
+	if audioTrack.Publisher() != nil {
+		t.Error("Expected track publisher to be nil after publisher left")
+	}
+	if audioTrack.State() != TrackStateUnpublished {
+		t.Errorf("Expected track state 'unpublished' after publisher left, got '%s'", audioTrack.State())
 	}
 }
 

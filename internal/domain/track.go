@@ -68,15 +68,20 @@ func (s TrackState) String() string {
 }
 
 // Track represents an audio or video media stream owned/published by a participant.
+//
+// Track is a pure domain object: it carries identity, kind, source, state,
+// publisher, and subscriber bookkeeping only. Media transport binding lives
+// in the webrtc package (webrtc.WebRTCTrack), which composes a domain.Track
+// with a pion track object; this type deliberately keeps no transport
+// reference so the domain stays independent of any WebRTC implementation.
 type Track struct {
-	mu        sync.RWMutex
-	id        string
-	kind      TrackKind
-	source    TrackSource
-	state     TrackState
-	publisher *Participant
+	mu          sync.RWMutex
+	id          string
+	kind        TrackKind
+	source      TrackSource
+	state       TrackState
+	publisher   *Participant
 	subscribers map[string]*Participant // Participants subscribed to this track
-	webrtcTrack interface{} // Placeholder for WebRTC track (e.g., *webrtc.TrackRemote)
 }
 
 // NewTrack creates a new Track with the given ID, kind, and source.
@@ -89,12 +94,11 @@ func NewTrack(id string, kind TrackKind, source TrackSource) (*Track, error) {
 		return nil, ErrInvalidTrackSource
 	}
 	return &Track{
-		id:           id,
-		kind:         kind,
-		source:       source,
-		state:        TrackStateCreated,
-		subscribers:  make(map[string]*Participant),
-		webrtcTrack:  nil,
+		id:          id,
+		kind:        kind,
+		source:      source,
+		state:       TrackStateCreated,
+		subscribers: make(map[string]*Participant),
 	}, nil
 }
 
@@ -107,7 +111,6 @@ func NewTrackUnvalidated(id string, kind TrackKind, source TrackSource) *Track {
 		source:      source,
 		state:       TrackStateCreated,
 		subscribers: make(map[string]*Participant),
-		webrtcTrack: nil,
 	}
 }
 
@@ -226,20 +229,6 @@ func (t *Track) GetSubscriber(participantID string) *Participant {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.subscribers[participantID]
-}
-
-// SetWebRTCTrack sets the underlying WebRTC track.
-func (t *Track) SetWebRTCTrack(track interface{}) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.webrtcTrack = track
-}
-
-// WebRTCTrack returns the underlying WebRTC track.
-func (t *Track) WebRTCTrack() interface{} {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.webrtcTrack
 }
 
 // HasSubscribers returns true if the track has any subscribers.

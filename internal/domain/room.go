@@ -108,7 +108,13 @@ func (r *Room) Join(participant *Participant) error {
 
 // Leave removes a participant from the room.
 // Returns an error if the room is closed or the participant is not found.
-// Also cleans up tracks published by the participant and removes orphaned tracks.
+//
+// Cleanup follows the canonical rule "loss of publisher destroys the track":
+// every track the leaver published is unpublished, its publisher reference is
+// cleared, it is removed from the room registry, and all remaining
+// subscribers are detached from it. Tracks the leaver subscribed to keep
+// living as long as their publisher is present; they are destroyed too if
+// this departure orphans them.
 func (r *Room) Leave(participantID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -122,19 +128,33 @@ func (r *Room) Leave(participantID string) error {
 		return ErrParticipantNotFound
 	}
 
-	// Clean up tracks published by this participant
-	for _, track := range participant.PublishedTracks() {
-		delete(r.tracks, track)
+	// Destroy tracks published by the leaver and detach their subscribers.
+	for _, trackID := range participant.PublishedTracks() {
+		// Fetch the track object first; all track mutations happen on the
+		// object so a stale registry entry cannot be dereferenced.
+		if track := participant.GetPublishedTrack(trackID); track != nil {
+			r.destroyTrackLocked(track, participantID)
+		}
 	}
 
-	// Clean up subscriptions from this participant
-	for _, track := range participant.SubscribedTracks() {
-		if t := r.tracks[track]; t != nil {
-			t.RemoveSubscriber(participantID)
-			// If track has no more subscribers and no publisher, remove it
-			if !t.HasSubscribers() && t.Publisher() == nil {
-				delete(r.tracks, track)
-			}
+	// Registry hygiene: purge orphaned entries. These appear when
+	// Participant.Leave already ran for the leaver (it unpublishes and clears
+	// publisher links, so the attribution loop above cannot see them) and
+	// cover any other inconsistent registry state. The registry must only
+	// ever hold live tracks.
+	for _, track := range r.tracks {
+		if track.State() == TrackStateUnpublished && track.Publisher() == nil {
+			r.destroyTrackLocked(track, participantID)
+		}
+	}
+
+	// Drop the leaver's own subscriptions; destroy tracks that are now both
+	// unpublishable and unwatched.
+	for _, trackID := range participant.SubscribedTracks() {
+		_ = participant.UnsubscribeTrack(trackID)
+
+		if track := r.tracks[trackID]; track != nil && !track.HasSubscribers() && track.Publisher() == nil {
+			delete(r.tracks, trackID)
 		}
 	}
 
@@ -144,7 +164,8 @@ func (r *Room) Leave(participantID string) error {
 
 // Close transitions the room to the closed state and removes all participants.
 // This method is idempotent; calling it on an already closed room has no effect.
-// Also cleans up all tracks in the room.
+// Participants are detached via Participant.Leave before the maps are wiped,
+// so publication and subscription bookkeeping stays consistent everywhere.
 func (r *Room) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -154,6 +175,14 @@ func (r *Room) Close() error {
 	}
 
 	r.state = RoomStateClosed
+
+	// Detach everyone first: Participant.Leave unpublishes own tracks,
+	// clears subscription bookkeeping, and detaches from subscribed tracks.
+	// It never fans out across participants, so no ABBA lock hazard exists.
+	for _, participant := range r.participants {
+		participant.Leave()
+	}
+
 	r.participants = make(map[string]*Participant)
 	r.tracks = make(map[string]*Track)
 	return nil
@@ -226,6 +255,9 @@ func (r *Room) Tracks() []string {
 }
 
 // SubscribeToTrack allows a participant to subscribe to a track in the room.
+// Tracks missing from the room registry are resolved by scanning the
+// published tracks of the room's participants, so direct publication via
+// Participant.PublishTrack remains subscribable.
 func (r *Room) SubscribeToTrack(participant *Participant, trackID string) error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -236,13 +268,20 @@ func (r *Room) SubscribeToTrack(participant *Participant, trackID string) error 
 
 	track := r.tracks[trackID]
 	if track == nil {
+		track = r.resolvePublishedTrackLocked(trackID)
+	}
+	if track == nil {
 		return ErrTrackNotFound
 	}
 
 	return participant.SubscribeTrack(track)
 }
 
-// UnsubscribeFromTrack allows a participant to unsubscribe from a track in the room.
+// UnsubscribeFromTrack allows a participant to unsubscribe from a track in
+// the room. The removal itself is owned by Participant.UnsubscribeTrack
+// (semantics unchanged post-TASK-015); this method only validates that the
+// track belongs to the room, resolving through participants when the registry
+// entry is absent.
 func (r *Room) UnsubscribeFromTrack(participant *Participant, trackID string) error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -251,5 +290,46 @@ func (r *Room) UnsubscribeFromTrack(participant *Participant, trackID string) er
 		return ErrRoomClosed
 	}
 
+	if r.tracks[trackID] == nil && r.resolvePublishedTrackLocked(trackID) == nil {
+		return ErrTrackNotFound
+	}
+
 	return participant.UnsubscribeTrack(trackID)
+}
+
+// resolvePublishedTrackLocked scans the published tracks of all room
+// participants looking for trackID. Callers must hold r.mu (read or write);
+// locking follows the room > participant > track hierarchy.
+func (r *Room) resolvePublishedTrackLocked(trackID string) *Track {
+	for _, participant := range r.participants {
+		if track := participant.GetPublishedTrack(trackID); track != nil {
+			return track
+		}
+	}
+	return nil
+}
+
+// destroyTrackLocked implements the canonical "loss of publisher destroys the
+// track" teardown: unpublish, clear ownership, drop from the registry, and
+// detach every remaining subscriber. Detachment removes the track from each
+// subscriber's bookkeeping (via UnsubscribeTrack) and, as a safety net for
+// subscribers that can no longer run it themselves (e.g. already Left),
+// directly from the track's subscriber set.
+//
+// Callers must hold r.mu for writing; locking follows the
+// room > participant > track hierarchy.
+func (r *Room) destroyTrackLocked(track *Track, excludeParticipantID string) {
+	track.Unpublish()
+	track.SetPublisher(nil)
+	delete(r.tracks, track.ID())
+
+	for _, subscriberID := range track.Subscribers() {
+		if subscriberID == excludeParticipantID {
+			continue
+		}
+		if subscriber, ok := r.participants[subscriberID]; ok {
+			_ = subscriber.UnsubscribeTrack(track.ID())
+		}
+		track.RemoveSubscriber(subscriberID)
+	}
 }
