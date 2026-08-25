@@ -1,0 +1,12 @@
+version: 1
+provider: openrouter
+base_url: https://openrouter.ai/api/v1
+credential_env: OPENROUTER_API_KEY
+models:
+  team-lead: openai:nvidia/nemotron-3.5-lightning:free
+  architect: openai:z-ai/glm-5.2
+  core-engineer: openai:z-ai/glm-5.2
+  devops-sre: openai:stealth/ox-alpha
+  qa-test: openai:cohere/north-mini-code:free
+  code-reviewer: openai:stealth/ox-alpha
+  release-maintainer: openai:nvidia/nemotron-3.5-lightning:free

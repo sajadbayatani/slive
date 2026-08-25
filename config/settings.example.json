@@ -1,0 +1,55 @@
+{
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "anthropic/claude-opus-4.6",
+        "name": "OpenRouter / Claude Opus 4.6",
+        "envKey": "OPENROUTER_API_KEY",
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "generationConfig": {
+          "timeout": 180000,
+          "maxRetries": 3
+        }
+      },
+      {
+        "id": "anthropic/claude-sonnet-4.6",
+        "name": "OpenRouter / Claude Sonnet 4.6",
+        "envKey": "OPENROUTER_API_KEY",
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "generationConfig": {
+          "timeout": 180000,
+          "maxRetries": 3
+        }
+      },
+      {
+        "id": "google/gemini-3.1-pro-preview",
+        "name": "OpenRouter / Gemini 3.1 Pro Preview",
+        "envKey": "OPENROUTER_API_KEY",
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "generationConfig": {
+          "timeout": 180000,
+          "maxRetries": 3
+        }
+      }
+    ]
+  },
+  "model": {
+    "name": "anthropic/claude-sonnet-4.6"
+  },
+  "tools": {
+    "approvalMode": "auto"
+  },
+  "permissions": {
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.config/gcloud/**)",
+      "Bash(rm -rf *)",
+      "Bash(git push *)",
+      "Bash(git reset --hard *)",
+      "Bash(git clean -fd *)"
+    ]
+  }
+}

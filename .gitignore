@@ -1,0 +1,50 @@
+# Binaries
+/bin/
+/dist/
+
+# Go
+*.test
+*.out
+.gocache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets
+.env
+.envrc
+.env.*
+!.env.example
+
+# Qwen local/runtime files
+.qwen
+agents/
+tasks/
+state/
+skills/
+roadmap/
+reports/
+docs/AGENT*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Coverage
+coverage.out
+coverage.html
+
+# Temporary files
+tmp/
+temp/
