@@ -27,4 +27,9 @@ var (
 
 	// ErrNegotiationFailed is returned when SDP negotiation fails.
 	ErrNegotiationFailed = errors.New("negotiation failed")
+
+	// ErrICEFailed is returned when adding a remote ICE candidate kept
+	// failing until retries were exhausted; it wraps the last underlying
+	// error so callers can inspect the root cause with errors.Is.
+	ErrICEFailed = errors.New("ice candidate failed")
 )

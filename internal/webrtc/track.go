@@ -110,20 +110,21 @@ func (t *WebRTCTrack) SetPublisher(p *domain.Participant) {
 }
 
 // Read reads RTP packets from the track.
+//
+// The underlying reader reference is copied while holding the lock and the
+// lock is released before any blocking I/O: TrackRemote.Read blocks until the
+// next packet arrives, and holding t.mu across that window would deadlock a
+// concurrent Close (which needs the write lock).
 func (t *WebRTCTrack) Read(b []byte) (int, error) {
 	t.mu.RLock()
-	defer t.mu.RUnlock()
-	if t.track == nil {
+	remote, ok := t.track.(*webrtc.TrackRemote)
+	t.mu.RUnlock()
+
+	if !ok || remote == nil {
 		return 0, ErrTrackNotReady
 	}
-	// For TrackRemote, we need to handle the new Read signature
-	if tr, ok := t.track.(*webrtc.TrackRemote); ok {
-		n, _, err := tr.Read(b)
-		return n, err
-	}
-	// For TrackLocal, we need to check if it has a Read method
-	// Since TrackLocal is an interface, we'll try to read if possible
-	return 0, ErrTrackNotReady
+	n, _, err := remote.Read(b)
+	return n, err
 }
 
 // Close closes the underlying WebRTC track.

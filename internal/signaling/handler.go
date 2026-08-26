@@ -2,7 +2,7 @@ package signaling
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 
@@ -21,6 +21,10 @@ type Handler struct {
 	// creates; it defaults to DefaultPeerConnectionConfig() and can be
 	// overridden with WithPeerConnectionConfig.
 	peerConnectionConfig webrtc.PeerConnectionConfig
+	// logger receives structured lifecycle and error events; it is also
+	// handed to every WebSocket connection and peer connection created by
+	// this handler.
+	logger *slog.Logger
 }
 
 // HandlerOption customises a Handler at construction time.
@@ -35,6 +39,17 @@ func WithPeerConnectionConfig(config webrtc.PeerConnectionConfig) HandlerOption 
 	}
 }
 
+// WithLogger sets the structured logger used for connection lifecycle and
+// error events; it is propagated to every WebSocket connection and peer
+// connection the handler creates. Passing nil keeps the default logger.
+func WithLogger(logger *slog.Logger) HandlerOption {
+	return func(h *Handler) {
+		if logger != nil {
+			h.logger = logger
+		}
+	}
+}
+
 // NewHandler creates a new Handler.
 func NewHandler(roomManager *RoomManager, opts ...HandlerOption) *Handler {
 	h := &Handler{
@@ -42,6 +57,7 @@ func NewHandler(roomManager *RoomManager, opts ...HandlerOption) *Handler {
 		connectionManager:    NewConnectionManager(),
 		peerConnections:      make(map[string]*webrtc.PeerConnection),
 		peerConnectionConfig: webrtc.DefaultPeerConnectionConfig(),
+		logger:               slog.Default(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -64,9 +80,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create a new WebSocket connection
-	conn, err := NewConnection(w, r, roomID, participantID)
+	conn, err := NewConnection(h.logger, w, r, roomID, participantID)
 	if err != nil {
-		log.Printf("Failed to upgrade WebSocket connection: %v", err)
+		h.logger.Error("failed to upgrade websocket connection",
+			"event", "ws_upgrade_failed",
+			"room_id", roomID,
+			"participant_id", participantID,
+			"error", err,
+		)
 		return
 	}
 
@@ -95,7 +116,12 @@ func (h *Handler) handleConnection(conn *Connection) {
 	// Get or create the room
 	room, err := h.roomManager.GetOrCreateRoom(conn.RoomID())
 	if err != nil {
-		log.Printf("Failed to get or create room: %v", err)
+		h.logger.Error("failed to get or create room",
+			"event", "room_lookup_failed",
+			"participant_id", conn.ID(),
+			"room_id", conn.RoomID(),
+			"error", err,
+		)
 		_ = conn.Send(MessageTypeError, ErrorResponse{
 			Error:       "Failed to get or create room",
 			Code:        ErrorCodeInternalError,
@@ -117,7 +143,12 @@ func (h *Handler) handleConnection(conn *Connection) {
 		// Create a new participant
 		participant = domain.NewParticipant(conn.ID(), "Participant "+conn.ID())
 		if err := room.Join(participant); err != nil {
-			log.Printf("Failed to join room: %v", err)
+			h.logger.Error("failed to join room",
+				"event", "join_failed",
+				"participant_id", conn.ID(),
+				"room_id", room.ID(),
+				"error", err,
+			)
 			_ = conn.Send(MessageTypeError, ErrorResponse{
 				Error:       "Failed to join room",
 				Code:        errorCodeFromDomainError(err),
@@ -129,7 +160,11 @@ func (h *Handler) handleConnection(conn *Connection) {
 
 		// Initialize a peer connection for the participant
 		if _, err := h.ensurePeerConnection(participant, sender); err != nil {
-			log.Printf("Failed to create peer connection: %v", err)
+			h.logger.Error("failed to create peer connection",
+				"event", "peer_connection_create_failed",
+				"participant_id", participant.ID(),
+				"error", err,
+			)
 			_ = conn.Send(MessageTypeError, ErrorResponse{
 				Error:       "Failed to create peer connection",
 				Code:        ErrorCodeInternalError,
@@ -147,13 +182,22 @@ func (h *Handler) handleConnection(conn *Connection) {
 		// Reuse the existing peer connection or replace it when unusable;
 		// either way its signaling output follows the new connection.
 		if _, err := h.ensurePeerConnection(participant, sender); err != nil {
-			log.Printf("Failed to recreate peer connection on reconnect: %v", err)
+			h.logger.Warn("failed to recreate peer connection on reconnect",
+				"event", "peer_connection_recreate_failed",
+				"participant_id", participant.ID(),
+				"error", err,
+			)
 		}
 	}
 
 	// Send room joined response
 	if err := h.sendRoomJoined(conn, room, participant); err != nil {
-		log.Printf("Failed to send room joined response: %v", err)
+		h.logger.Error("failed to send room joined response",
+			"event", "room_joined_send_failed",
+			"participant_id", conn.ID(),
+			"room_id", room.ID(),
+			"error", err,
+		)
 		return
 	}
 
@@ -162,15 +206,29 @@ func (h *Handler) handleConnection(conn *Connection) {
 		msg, err := conn.Receive()
 		if err != nil {
 			if err == ErrConnectionClosed {
-				log.Printf("Connection closed for participant %s", conn.ID())
+				h.logger.Info("message loop ended: transport closed",
+					"event", "receive_loop_ended",
+					"participant_id", conn.ID(),
+					"reason", "connection_closed",
+				)
 			} else {
-				log.Printf("Failed to receive message: %v", err)
+				h.logger.Warn("failed to receive message; ending message loop",
+					"event", "receive_loop_ended",
+					"participant_id", conn.ID(),
+					"reason", "receive_failed",
+					"error", err,
+				)
 			}
 			break
 		}
 
 		if err := h.handleMessage(conn, room, participant, msg); err != nil {
-			log.Printf("Failed to handle message: %v", err)
+			h.logger.Warn("failed to handle message",
+				"event", "message_handle_failed",
+				"participant_id", conn.ID(),
+				"msg_type", string(msg.Type),
+				"error", err,
+			)
 			_ = conn.Send(MessageTypeError, ErrorResponse{
 				Error:       err.Error(),
 				Code:        errorCodeFromDomainError(err),
@@ -179,7 +237,8 @@ func (h *Handler) handleConnection(conn *Connection) {
 		}
 	}
 
-	// Clean up when connection closes
+	// Clean up when connection closes. The transport is gone, but the
+	// session (participant + peer connection) stays alive for reconnect.
 	h.handleConnectionClosed(room, participant)
 }
 
@@ -196,9 +255,7 @@ func (h *Handler) ensurePeerConnection(participant *domain.Participant, sender w
 	existing := h.peerConnections[participant.ID()]
 	h.peerConnectionsMutex.RUnlock()
 
-	if existing != nil &&
-		existing.State() != webrtc.PeerConnectionStateClosed &&
-		existing.State() != webrtc.PeerConnectionStateFailed {
+	if existing != nil && existing.State().Usable() {
 		// Update the signaling sender to use the new connection
 		existing.UpdateSignalingSender(sender)
 		return existing, nil
@@ -252,7 +309,11 @@ func (h *Handler) handleMessage(conn *Connection, room *domain.Room, participant
 		return h.handleICECandidate(conn, room, participant, msg)
 
 	default:
-		log.Printf("Unknown message type: %s", msg.Type)
+		h.logger.Debug("ignoring unknown message type",
+			"event", "unknown_message_type",
+			"participant_id", conn.ID(),
+			"msg_type", string(msg.Type),
+		)
 		return nil
 	}
 }
@@ -304,6 +365,10 @@ func (h *Handler) handleJoinRoom(conn *Connection, room *domain.Room, participan
 }
 
 // handleLeaveRoom handles a leave room request.
+//
+// This is the explicit leave path: unlike a WebSocket drop it is terminal —
+// the participant leaves the room and its peer connection is closed and
+// removed from the handler registry (see closePeerConnection).
 func (h *Handler) handleLeaveRoom(conn *Connection, room *domain.Room, participant *domain.Participant, msg *Message) error {
 	var req LeaveRoomRequest
 	if err := msg.UnmarshalData(&req); err != nil {
@@ -314,6 +379,10 @@ func (h *Handler) handleLeaveRoom(conn *Connection, room *domain.Room, participa
 	if err := room.Leave(req.ParticipantID); err != nil {
 		return err
 	}
+
+	// Tear down the peer connection: an explicit leave does not get to
+	// reconnect into the same media session.
+	h.closePeerConnection(req.ParticipantID)
 
 	// Send response
 	resp := RoomLeftResponse{
@@ -330,6 +399,31 @@ func (h *Handler) handleLeaveRoom(conn *Connection, room *domain.Room, participa
 	h.broadcastParticipantLeft(room, participant)
 
 	return nil
+}
+
+// closePeerConnection closes and deregisters the peer connection of the given
+// participant. Used on the explicit leave_room path; the WebSocket-drop path
+// deliberately keeps the peer connection alive so a reconnecting client
+// resumes its media session.
+func (h *Handler) closePeerConnection(participantID string) {
+	h.peerConnectionsMutex.Lock()
+	pc, exists := h.peerConnections[participantID]
+	if exists {
+		delete(h.peerConnections, participantID)
+	}
+	h.peerConnectionsMutex.Unlock()
+
+	if !exists {
+		return
+	}
+
+	if err := pc.Close(); err != nil {
+		h.logger.Warn("failed to close peer connection",
+			"event", "peer_connection_close_failed",
+			"participant_id", participantID,
+			"error", err,
+		)
+	}
 }
 
 // handlePublishTrack handles a publish track request.
@@ -445,42 +539,51 @@ func (h *Handler) handleSubscribeTrack(conn *Connection, room *domain.Room, part
 	return conn.Send(MessageTypeTrackSubscribed, resp)
 }
 
-// handleOffer handles a WebRTC offer.
+// handleOffer handles a WebRTC offer: the offer is applied to the target
+// participant's peer connection (the server answers on its behalf) and the
+// generated answer is sent back to the source connection.
+//
+// Failures are reported to the client through sendWebRTCError with a mapped
+// error code instead of falling back to the generic message loop, which
+// would label every failure internal_error.
 func (h *Handler) handleOffer(conn *Connection, room *domain.Room, participant *domain.Participant, msg *Message) error {
 	var req OfferRequest
 	if err := msg.UnmarshalData(&req); err != nil {
-		return err
+		h.sendWebRTCError(conn, msg.Type, err)
+		return nil
 	}
 
 	// Validate the offer request
 	if err := ValidateOfferRequest(&req); err != nil {
-		return err
+		h.sendWebRTCError(conn, msg.Type, err)
+		return nil
 	}
 
 	// Find the target participant
 	target := room.GetParticipant(req.TargetParticipantID)
 	if target == nil {
-		return domain.ErrParticipantNotFound
+		h.sendWebRTCError(conn, msg.Type, domain.ErrParticipantNotFound)
+		return nil
 	}
 
 	// Get the target peer connection
-	h.peerConnectionsMutex.RLock()
-	pc := h.peerConnections[req.TargetParticipantID]
-	h.peerConnectionsMutex.RUnlock()
-
+	pc := h.getPeerConnection(req.TargetParticipantID)
 	if pc == nil {
-		return ErrConnectionNotFound
+		h.sendWebRTCError(conn, msg.Type, ErrConnectionNotFound)
+		return nil
 	}
 
 	offer, err := webrtc.NewSessionDescriptionFromString(req.SDP, pionwebrtc.SDPTypeOffer)
 	if err != nil {
-		return err
+		h.sendWebRTCError(conn, msg.Type, err)
+		return nil
 	}
 
 	// CreateAnswer installs the remote offer before generating the answer.
 	answer, err := pc.CreateAnswer(offer)
 	if err != nil {
-		return err
+		h.sendWebRTCError(conn, msg.Type, err)
+		return nil
 	}
 
 	// Send the answer back to the source participant
@@ -492,87 +595,135 @@ func (h *Handler) handleOffer(conn *Connection, room *domain.Room, participant *
 	return conn.Send(MessageTypeAnswer, answerNotification)
 }
 
-// handleAnswer handles a WebRTC answer.
+// handleAnswer handles a WebRTC answer by installing it as the remote
+// description of the target participant's peer connection. Errors are mapped
+// and reported to the client via sendWebRTCError.
 func (h *Handler) handleAnswer(conn *Connection, room *domain.Room, participant *domain.Participant, msg *Message) error {
 	var req AnswerRequest
 	if err := msg.UnmarshalData(&req); err != nil {
-		return err
+		h.sendWebRTCError(conn, msg.Type, err)
+		return nil
 	}
 
 	// Validate the answer request
 	if err := ValidateAnswerRequest(&req); err != nil {
-		return err
+		h.sendWebRTCError(conn, msg.Type, err)
+		return nil
 	}
 
 	// The answer is applied to the peer connection owned by its target.
-	h.peerConnectionsMutex.RLock()
-	pc := h.peerConnections[req.TargetParticipantID]
-	h.peerConnectionsMutex.RUnlock()
-
+	pc := h.getPeerConnection(req.TargetParticipantID)
 	if pc == nil {
-		return ErrConnectionNotFound
+		h.sendWebRTCError(conn, msg.Type, ErrConnectionNotFound)
+		return nil
 	}
 
 	answer, err := webrtc.NewSessionDescriptionFromString(req.SDP, pionwebrtc.SDPTypeAnswer)
 	if err != nil {
-		return err
+		h.sendWebRTCError(conn, msg.Type, err)
+		return nil
 	}
 
 	// Set the remote description on the source peer connection
-	return pc.SetRemoteDescription(answer)
+	if err := pc.SetRemoteDescription(answer); err != nil {
+		h.sendWebRTCError(conn, msg.Type, err)
+		return nil
+	}
+	return nil
 }
 
-// handleICECandidate handles an ICE candidate.
+// handleICECandidate handles an ICE candidate by adding it to the target
+// participant's peer connection (with bounded retries for transient
+// failures). Errors are mapped and reported to the client via
+// sendWebRTCError.
 func (h *Handler) handleICECandidate(conn *Connection, room *domain.Room, participant *domain.Participant, msg *Message) error {
 	var req ICECandidateRequest
 	if err := msg.UnmarshalData(&req); err != nil {
-		return err
+		h.sendWebRTCError(conn, msg.Type, err)
+		return nil
 	}
 
 	// Validate the ICE candidate request
 	if err := ValidateICECandidateRequest(&req); err != nil {
-		return err
+		h.sendWebRTCError(conn, msg.Type, err)
+		return nil
 	}
 
 	// Get the target peer connection
-	h.peerConnectionsMutex.RLock()
-	pc := h.peerConnections[req.TargetParticipantID]
-	h.peerConnectionsMutex.RUnlock()
-
+	pc := h.getPeerConnection(req.TargetParticipantID)
 	if pc == nil {
-		return ErrConnectionNotFound
+		h.sendWebRTCError(conn, msg.Type, ErrConnectionNotFound)
+		return nil
 	}
 
 	candidate, err := webrtc.NewICECandidateFromString(req.Candidate)
 	if err != nil {
-		return err
+		h.sendWebRTCError(conn, msg.Type, err)
+		return nil
 	}
 	candidate.SetSDPMid(req.SDPMid)
 	candidate.SetSDPMLineIndex(uint16(req.SDPMLineIndex))
 
 	// Add the ICE candidate to the target peer connection with retry for transient failures
-	return pc.AddICECandidateWithRetry(candidate)
+	if err := pc.AddICECandidateWithRetry(candidate); err != nil {
+		h.sendWebRTCError(conn, msg.Type, err)
+		return nil
+	}
+	return nil
 }
 
-// handleConnectionClosed handles cleanup when a connection closes.
+// getPeerConnection looks up the peer connection registered for a
+// participant.
+func (h *Handler) getPeerConnection(participantID string) *webrtc.PeerConnection {
+	h.peerConnectionsMutex.RLock()
+	defer h.peerConnectionsMutex.RUnlock()
+	return h.peerConnections[participantID]
+}
+
+// sendWebRTCError replies to a WebRTC signaling request with an ErrorResponse
+// carrying the mapped error code (see errorCodeFromError). The generic
+// message loop would report any returned error as internal_error, so WebRTC
+// handlers report through this helper and then return nil.
+func (h *Handler) sendWebRTCError(conn *Connection, requestType MessageType, err error) {
+	code := errorCodeFromError(err)
+	h.logger.Warn("webrtc signaling operation failed",
+		"event", "webrtc_operation_failed",
+		"participant_id", conn.ID(),
+		"request_type", string(requestType),
+		"code", code,
+		"error", err,
+	)
+
+	_ = conn.Send(MessageTypeError, ErrorResponse{
+		Error:       err.Error(),
+		Code:        code,
+		RequestType: string(requestType),
+	})
+}
+
+// handleConnectionClosed handles cleanup when the WebSocket transport drops.
+//
+// This is deliberately NOT a leave: the participant stays joined to the room
+// and its peer connection stays registered and usable, so a reconnecting
+// client resumes its media session — ensurePeerConnection swaps the signaling
+// sender onto the new socket, or replaces the connection wholesale when it
+// turned unusable meanwhile. Only the transport registry entry goes away,
+// handled by handleConnection's defer RemoveIf. Explicit leave_room is the
+// terminal path (see handleLeaveRoom/closePeerConnection).
 func (h *Handler) handleConnectionClosed(room *domain.Room, participant *domain.Participant) {
-	// Remove participant from room
-	if err := room.Leave(participant.ID()); err != nil {
-		log.Printf("Failed to remove participant from room: %v", err)
+	pc := h.getPeerConnection(participant.ID())
+
+	pcState := "<none>"
+	if pc != nil {
+		pcState = pc.State().String()
 	}
 
-	// Close and remove the peer connection
-	h.peerConnectionsMutex.Lock()
-	if pc, exists := h.peerConnections[participant.ID()]; exists {
-		if err := pc.Close(); err != nil {
-			log.Printf("Failed to close peer connection: %v", err)
-		}
-		delete(h.peerConnections, participant.ID())
-	}
-	h.peerConnectionsMutex.Unlock()
-
-	// Notify other participants
-	h.broadcastParticipantLeft(room, participant)
+	h.logger.Info("peer transport dropped; session kept alive for reconnect",
+		"event", "peer_disconnected",
+		"participant_id", participant.ID(),
+		"room_id", room.ID(),
+		"peer_connection_state", pcState,
+	)
 }
 
 // sendRoomJoined sends a room joined response.

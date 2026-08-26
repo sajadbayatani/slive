@@ -1,9 +1,11 @@
 package signaling
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/sajadbayatani/slive/internal/domain"
+	webrtc "github.com/sajadbayatani/slive/internal/webrtc"
 )
 
 func TestRoomManager_CreateRoom(t *testing.T) {
@@ -158,6 +160,71 @@ func TestErrorCodeFromDomainError(t *testing.T) {
 				t.Errorf("Expected error code '%s', got '%s'", tt.expected, code)
 			}
 		})
+	}
+}
+
+// TestErrorCodeFromError pins the general error mapping used by the WebRTC
+// signaling handlers: wrapped sentinel chains keep their specific code, and
+// anything unrecognized falls through to errorCodeFromDomainError.
+func TestErrorCodeFromError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected string
+	}{
+		{"Nil", nil, ""},
+		// Validation failures carry ErrInvalidRequest through fmt wrapping.
+		{"InvalidRequest", fmt.Errorf("%w: sdp exceeds maximum length of %d bytes", ErrInvalidRequest, MaxSDPLength), ErrorCodeInvalidRequest},
+		// Transport / registry sentinels.
+		{"ConnectionNotFound", ErrConnectionNotFound, ErrorCodeConnectionNotFound},
+		{"NoPeerConnectionWrapped", fmt.Errorf("lookup failed: %w", webrtc.ErrNoPeerConnection), ErrorCodeConnectionNotFound},
+		// WebRTC sentinels, including nested wrapping.
+		{"ICEFailedWrappingClosed", fmt.Errorf("%w: %v", webrtc.ErrICEFailed, webrtc.ErrPeerConnectionClosed), ErrorCodeICEFailed},
+		{"PeerConnectionClosed", fmt.Errorf("apply failed: %w", webrtc.ErrPeerConnectionClosed), ErrorCodePeerConnectionClosed},
+		{"NegotiationFailed", webrtc.ErrNegotiationFailed, ErrorCodeNegotiationFailed},
+		{"WebRTCTrackNotFound", webrtc.ErrTrackNotFound, ErrorCodeTrackNotFound},
+		{"InvalidSDP", webrtc.ErrInvalidSDP, ErrorCodeInvalidWebRTCMessage},
+		{"InvalidICECandidate", webrtc.ErrInvalidICECandidate, ErrorCodeInvalidWebRTCMessage},
+		{"TrackNotReady", webrtc.ErrTrackNotReady, ErrorCodeInvalidWebRTCMessage},
+		// Domain errors delegate unchanged.
+		{"DomainRoomClosed", domain.ErrRoomClosed, ErrorCodeRoomClosed},
+		{"DomainParticipantNotFound", domain.ErrParticipantNotFound, ErrorCodeParticipantNotFound},
+		{"DomainTrackNotFound", domain.ErrTrackNotFound, ErrorCodeTrackNotFound},
+		{"DomainUnknown", domain.ErrParticipantAlreadyExists, ErrorCodeInternalError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if code := errorCodeFromError(tt.err); code != tt.expected {
+				t.Errorf("errorCodeFromError(%v) = %q, want %q", tt.err, code, tt.expected)
+			}
+		})
+	}
+}
+
+// TestErrorCodeFromErrorMatchesDomainMapping asserts parity between the
+// generic mapping and the domain-only mapping: every error the domain mapping
+// classifies must receive the identical code from errorCodeFromError.
+func TestErrorCodeFromErrorMatchesDomainMapping(t *testing.T) {
+	domainErrors := []error{
+		domain.ErrRoomClosed,
+		domain.ErrParticipantNotFound,
+		domain.ErrTrackNotFound,
+		domain.ErrParticipantAlreadyExists,
+		domain.ErrParticipantLeft,
+		domain.ErrTrackAlreadyPublished,
+		domain.ErrTrackAlreadySubscribed,
+	}
+
+	for _, err := range domainErrors {
+		want := errorCodeFromDomainError(err)
+		got := errorCodeFromError(err)
+		if got != want {
+			t.Errorf("parity broken for %v: errorCodeFromError=%q errorCodeFromDomainError=%q", err, got, want)
+		}
+		if want == "" {
+			t.Errorf("domain error %v unexpectedly unmapped", err)
+		}
 	}
 }
 

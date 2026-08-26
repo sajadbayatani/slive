@@ -2,9 +2,11 @@ package signaling
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/sajadbayatani/slive/internal/domain"
+	webrtc "github.com/sajadbayatani/slive/internal/webrtc"
 )
 
 // MessageType represents the type of signaling message.
@@ -266,7 +268,45 @@ const (
 	ErrorCodeInvalidRequest       = "invalid_request"
 	ErrorCodeInternalError        = "internal_error"
 	ErrorCodeInvalidWebRTCMessage = "invalid_webrtc_message"
+	ErrorCodeConnectionNotFound   = "connection_not_found"
+	ErrorCodePeerConnectionClosed = "peer_connection_closed"
+	ErrorCodeNegotiationFailed    = "negotiation_failed"
+	ErrorCodeICEFailed            = "ice_failed"
 )
+
+// ErrInvalidRequest marks request payloads that failed validation; it is
+// mapped to ErrorCodeInvalidRequest by errorCodeFromError.
+var ErrInvalidRequest = errors.New("invalid request")
+
+// errorCodeFromError maps an arbitrary error to its signaling error code.
+// Transport- and WebRTC-level sentinels are matched with errors.Is so wrapped
+// error chains keep their specific code (e.g. an exhausted ICE retry wraps
+// both webrtc.ErrICEFailed and webrtc.ErrPeerConnectionClosed and reports
+// ice_failed). Everything else falls through to the domain-error mapping.
+func errorCodeFromError(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, ErrInvalidRequest):
+		return ErrorCodeInvalidRequest
+	case errors.Is(err, ErrConnectionNotFound):
+		return ErrorCodeConnectionNotFound
+	case errors.Is(err, webrtc.ErrICEFailed):
+		return ErrorCodeICEFailed
+	case errors.Is(err, webrtc.ErrPeerConnectionClosed):
+		return ErrorCodePeerConnectionClosed
+	case errors.Is(err, webrtc.ErrNegotiationFailed):
+		return ErrorCodeNegotiationFailed
+	case errors.Is(err, webrtc.ErrNoPeerConnection):
+		return ErrorCodeConnectionNotFound
+	case errors.Is(err, webrtc.ErrTrackNotFound):
+		return ErrorCodeTrackNotFound
+	case errors.Is(err, webrtc.ErrInvalidSDP), errors.Is(err, webrtc.ErrInvalidICECandidate), errors.Is(err, webrtc.ErrTrackNotReady):
+		return ErrorCodeInvalidWebRTCMessage
+	default:
+		return errorCodeFromDomainError(err)
+	}
+}
 
 // WebRTC message validation constants.
 const (
@@ -292,84 +332,87 @@ func errorCodeFromDomainError(err error) string {
 	}
 }
 
-// ValidateOfferRequest validates an offer request.
+// ValidateOfferRequest validates an offer request. Validation failures wrap
+// ErrInvalidRequest so they map to ErrorCodeInvalidRequest.
 func ValidateOfferRequest(req *OfferRequest) error {
 	if req == nil {
-		return fmt.Errorf("offer request cannot be nil")
+		return fmt.Errorf("%w: offer request cannot be nil", ErrInvalidRequest)
 	}
 
 	if req.ParticipantID == "" {
-		return fmt.Errorf("participant_id is required")
+		return fmt.Errorf("%w: participant_id is required", ErrInvalidRequest)
 	}
 
 	if req.TargetParticipantID == "" {
-		return fmt.Errorf("target_participant_id is required")
+		return fmt.Errorf("%w: target_participant_id is required", ErrInvalidRequest)
 	}
 
 	if req.SDP == "" {
-		return fmt.Errorf("sdp is required")
+		return fmt.Errorf("%w: sdp is required", ErrInvalidRequest)
 	}
 
 	if len(req.SDP) > MaxSDPLength {
-		return fmt.Errorf("sdp exceeds maximum length of %d bytes", MaxSDPLength)
+		return fmt.Errorf("%w: sdp exceeds maximum length of %d bytes", ErrInvalidRequest, MaxSDPLength)
 	}
 
 	return nil
 }
 
-// ValidateAnswerRequest validates an answer request.
+// ValidateAnswerRequest validates an answer request. Validation failures
+// wrap ErrInvalidRequest so they map to ErrorCodeInvalidRequest.
 func ValidateAnswerRequest(req *AnswerRequest) error {
 	if req == nil {
-		return fmt.Errorf("answer request cannot be nil")
+		return fmt.Errorf("%w: answer request cannot be nil", ErrInvalidRequest)
 	}
 
 	if req.ParticipantID == "" {
-		return fmt.Errorf("participant_id is required")
+		return fmt.Errorf("%w: participant_id is required", ErrInvalidRequest)
 	}
 
 	if req.TargetParticipantID == "" {
-		return fmt.Errorf("target_participant_id is required")
+		return fmt.Errorf("%w: target_participant_id is required", ErrInvalidRequest)
 	}
 
 	if req.SDP == "" {
-		return fmt.Errorf("sdp is required")
+		return fmt.Errorf("%w: sdp is required", ErrInvalidRequest)
 	}
 
 	if len(req.SDP) > MaxSDPLength {
-		return fmt.Errorf("sdp exceeds maximum length of %d bytes", MaxSDPLength)
+		return fmt.Errorf("%w: sdp exceeds maximum length of %d bytes", ErrInvalidRequest, MaxSDPLength)
 	}
 
 	return nil
 }
 
-// ValidateICECandidateRequest validates an ICE candidate request.
+// ValidateICECandidateRequest validates an ICE candidate request. Validation
+// failures wrap ErrInvalidRequest so they map to ErrorCodeInvalidRequest.
 func ValidateICECandidateRequest(req *ICECandidateRequest) error {
 	if req == nil {
-		return fmt.Errorf("ice candidate request cannot be nil")
+		return fmt.Errorf("%w: ice candidate request cannot be nil", ErrInvalidRequest)
 	}
 
 	if req.ParticipantID == "" {
-		return fmt.Errorf("participant_id is required")
+		return fmt.Errorf("%w: participant_id is required", ErrInvalidRequest)
 	}
 
 	if req.TargetParticipantID == "" {
-		return fmt.Errorf("target_participant_id is required")
+		return fmt.Errorf("%w: target_participant_id is required", ErrInvalidRequest)
 	}
 
 	if req.Candidate == "" {
-		return fmt.Errorf("candidate is required")
+		return fmt.Errorf("%w: candidate is required", ErrInvalidRequest)
 	}
 
 	if len(req.Candidate) > MaxCandidateLength {
-		return fmt.Errorf("candidate exceeds maximum length of %d bytes", MaxCandidateLength)
+		return fmt.Errorf("%w: candidate exceeds maximum length of %d bytes", ErrInvalidRequest, MaxCandidateLength)
 	}
 
 	if req.SDPMid == "" {
-		return fmt.Errorf("sdp_mid is required")
+		return fmt.Errorf("%w: sdp_mid is required", ErrInvalidRequest)
 	}
 
 	if req.SDPMLineIndex < 0 {
-		return fmt.Errorf("sdp_mline_index must be non-negative")
+		return fmt.Errorf("%w: sdp_mline_index must be non-negative", ErrInvalidRequest)
 	}
 
 	return nil

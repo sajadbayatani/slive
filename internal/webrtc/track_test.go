@@ -1,7 +1,10 @@
 package webrtc
 
 import (
+	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/pion/webrtc/v3"
 	"github.com/sajadbayatani/slive/internal/domain"
@@ -236,5 +239,61 @@ func TestWebRTCTrackNilPionTrack(t *testing.T) {
 	err = webRTCTrack.Close()
 	if err != nil {
 		t.Errorf("Expected Close to succeed with nil Pion track, got error: %v", err)
+	}
+}
+
+// TestWebRTCTrackReadCloseConcurrent is the regression test for the Read
+// lock-scope fix: Read used to hold t.mu across the (potentially blocking)
+// TrackRemote.Read call, so a concurrent Close could deadlock on the write
+// lock. Reads and Close must now be able to interleave freely — wg.Wait()
+// completing is the no-deadlock assertion, and -race watches for data races.
+func TestWebRTCTrackReadCloseConcurrent(t *testing.T) {
+	domainTrack, err := domain.NewTrack("audio-race", domain.TrackKindAudio, domain.TrackSourceMicrophone)
+	if err != nil {
+		t.Fatalf("Failed to create domain track: %v", err)
+	}
+	pionTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+		"audio-race",
+		"webrtc-audio",
+	)
+	if err != nil {
+		t.Fatalf("Failed to create Pion track: %v", err)
+	}
+
+	webRTCTrack := NewWebRTCTrack(domainTrack, pionTrack, webrtc.RTPCodecParameters{})
+
+	const readers = 8
+	var wg sync.WaitGroup
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 1500)
+			_, _ = webRTCTrack.Read(buf) // TrackLocal: fast-path error return
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = webRTCTrack.Close()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent Read/Close deadlocked")
+	}
+
+	// After Close the underlying reference is cleared and Read reports the
+	// track as not ready.
+	buf := make([]byte, 1500)
+	if _, err := webRTCTrack.Read(buf); !errors.Is(err, ErrTrackNotReady) {
+		t.Errorf("Read after Close = %v, want ErrTrackNotReady", err)
 	}
 }

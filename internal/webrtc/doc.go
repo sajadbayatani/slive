@@ -26,6 +26,36 @@
 // Operations attempted on a Closed or Failed connection return
 // ErrPeerConnectionClosed instead of panicking or blocking.
 //
+// PeerConnectionState.Usable reports whether a state can still carry media
+// (everything except Closed and Failed; Disconnected is usable because ICE
+// may self-heal). The signaling layer reuses usable connections across
+// reconnects and replaces unusable ones.
+//
+// # Structured logging
+//
+// Peer connections emit structured slog events for lifecycle transitions
+// (connection_state), failed automatic offer pushes (offer_create_failed),
+// signaling send failures (signaling_send_failed) and ICE retry exhaustion
+// (ice_retry_failed), each tagged with a participant_id where known. Choose
+// the destination per connection via PeerConnectionConfig.Logger; when nil,
+// slog.Default() is used. The signaling handler accepts its own logger via
+// WithLogger and propagates it to every connection it creates, so one logger
+// configured at startup covers the whole server.
+//
+// # Retry policy (ICE yes, SDP no)
+//
+// AddICECandidateWithRetry retries transient ICE candidate failures a bounded
+// number of times (defaultICERetryAttempts with linear defaultICERetryDelay
+// backoff) and reports exhaustion as ErrICEFailed wrapping the last error.
+// Both knobs are package vars so tests can shrink them.
+//
+// SDP operations are deliberately never retried. CreateOffer, CreateAnswer
+// and SetRemoteDescription mutate the negotiation state machine: a blind
+// retry after a wrong-state failure produces another wrong-state failure at
+// best and a duplicate offer or desynchronized description at worst. Those
+// failures are surfaced immediately to the signaling layer, which maps them
+// to negotiation_failed / peer_connection_closed for the remote client.
+//
 // # Negotiation flow (SFU-style: the server answers on behalf of its peers)
 //
 // Slive's server owns one PeerConnection per participant. Signaling messages

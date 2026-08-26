@@ -2,7 +2,7 @@ package webrtc
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 
 	"github.com/pion/webrtc/v3"
@@ -40,12 +40,26 @@ func (s PeerConnectionState) String() string {
 	}
 }
 
+// Usable reports whether a connection in this state can still carry media.
+// Only the terminal Closed state and the unrecoverable Failed state are
+// unusable; Disconnected is deliberately usable because ICE may self-heal
+// (NeedsReconnect describes that recoverable-drop case instead). The
+// signaling layer replaces unusable connections on reconnect and reuses
+// usable ones.
+func (s PeerConnectionState) Usable() bool {
+	return s != PeerConnectionStateClosed && s != PeerConnectionStateFailed
+}
+
 // PeerConnectionConfig holds configuration for creating a new PeerConnection.
 type PeerConnectionConfig struct {
 	// ICEServers is a list of ICE servers to use for NAT traversal.
 	ICEServers []webrtc.ICEServer
 	// SDPSemantics is the SDP semantics to use (e.g., "unified-plan").
 	SDPSemantics webrtc.SDPSemantics
+	// Logger receives structured lifecycle events for connections created
+	// with this config. A nil Logger resolves to slog.Default() inside
+	// NewPeerConnection, so the zero value stays usable.
+	Logger *slog.Logger
 }
 
 // DefaultPeerConnectionConfig returns a default PeerConnectionConfig.
@@ -75,6 +89,10 @@ type PeerConnection struct {
 	remoteTracks  map[string]*WebRTCTrack
 	participant   *domain.Participant
 	sendSignaling SignalingSender
+	// logger is resolved once at construction (config.Logger or
+	// slog.Default()) and never mutated afterwards, so it is read without
+	// holding mu.
+	logger *slog.Logger
 	// Event callbacks registered via OnNegotiationNeeded / OnICECandidate /
 	// OnTrack. They are stored on the struct and invoked from the pion event
 	// handlers below; a nil callback simply means "not interested".
@@ -87,6 +105,11 @@ type PeerConnection struct {
 
 // NewPeerConnection creates a new PeerConnection with the given configuration.
 func NewPeerConnection(config PeerConnectionConfig, participant *domain.Participant, sendSignaling SignalingSender) (*PeerConnection, error) {
+	logger := config.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	pionConfig := webrtc.Configuration{
 		ICEServers:   config.ICEServers,
 		SDPSemantics: config.SDPSemantics,
@@ -107,6 +130,7 @@ func NewPeerConnection(config PeerConnectionConfig, participant *domain.Particip
 		remoteTracks:  make(map[string]*WebRTCTrack),
 		participant:   participant,
 		sendSignaling: sendSignaling,
+		logger:        logger,
 		ctx:           ctx,
 		cancel:        cancel,
 	}
@@ -436,11 +460,28 @@ func (pc *PeerConnection) handleNegotiationNeeded() {
 	}
 
 	go func() {
+		participantID := ""
+		if p := pc.Participant(); p != nil {
+			participantID = p.ID()
+		}
+
 		offer, err := pc.CreateOffer()
 		if err != nil {
+			pc.logger.Warn("automatic offer push failed",
+				"event", "offer_create_failed",
+				"participant_id", participantID,
+				"error", err,
+			)
 			return
 		}
-		_ = sendSignaling("webrtc:offer", offer)
+		if err := sendSignaling("webrtc:offer", offer); err != nil {
+			pc.logger.Warn("failed to send offer over signaling channel",
+				"event", "signaling_send_failed",
+				"participant_id", participantID,
+				"msg_type", "webrtc:offer",
+				"error", err,
+			)
+		}
 	}()
 }
 
@@ -468,7 +509,18 @@ func (pc *PeerConnection) dispatchICECandidate(wrapped *ICECandidate) {
 
 	if sendSignaling != nil {
 		// Send the ICE candidate via signaling
-		_ = sendSignaling("webrtc:ice-candidate", wrapped)
+		if err := sendSignaling("webrtc:ice-candidate", wrapped); err != nil {
+			participantID := ""
+			if p := pc.Participant(); p != nil {
+				participantID = p.ID()
+			}
+			pc.logger.Warn("failed to send ICE candidate over signaling channel",
+				"event", "signaling_send_failed",
+				"participant_id", participantID,
+				"msg_type", "webrtc:ice-candidate",
+				"error", err,
+			)
+		}
 	}
 }
 
@@ -476,13 +528,23 @@ func (pc *PeerConnection) dispatchICECandidate(wrapped *ICECandidate) {
 func (pc *PeerConnection) handleTrack(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 	_ = receiver
 
+	participantID := ""
+	if p := pc.Participant(); p != nil {
+		participantID = p.ID()
+	}
+
 	// Create a domain track for the remote track
 	kind := webrtcTrackKindToDomain(track.Kind())
 	source := webrtcTrackSource(track.Kind())
 
 	domainTrack, err := domain.NewTrack(track.ID(), kind, source)
 	if err != nil {
-		// Log error but continue
+		pc.logger.Error("failed to wrap remote track in a domain track",
+			"event", "remote_track_rejected",
+			"participant_id", participantID,
+			"track_id", track.ID(),
+			"error", err,
+		)
 		return
 	}
 
@@ -516,21 +578,43 @@ func (pc *PeerConnection) handleConnectionStateChange(state webrtc.PeerConnectio
 		pc.state = PeerConnectionStateNew
 	case webrtc.PeerConnectionStateConnecting:
 		pc.state = PeerConnectionStateConnecting
-		log.Printf("webrtc: connection connecting participant=%s", participantID)
+		pc.logger.Debug("webrtc connection state changed",
+			"event", "connection_state",
+			"participant_id", participantID,
+			"state", "connecting",
+		)
 	case webrtc.PeerConnectionStateConnected:
 		pc.state = PeerConnectionStateConnected
-		log.Printf("webrtc: connection established participant=%s attempts=%d failures=%d",
-			participantID, ConnectionMetrics.AttemptsTotal(), ConnectionMetrics.FailuresTotal())
+		pc.logger.Info("webrtc connection established",
+			"event", "connection_state",
+			"participant_id", participantID,
+			"state", "connected",
+			"attempts", ConnectionMetrics.AttemptsTotal(),
+			"failures", ConnectionMetrics.FailuresTotal(),
+		)
 	case webrtc.PeerConnectionStateDisconnected:
 		pc.state = PeerConnectionStateDisconnected
-		log.Printf("webrtc: connection disconnected participant=%s", participantID)
+		pc.logger.Warn("webrtc connection disconnected",
+			"event", "connection_state",
+			"participant_id", participantID,
+			"state", "disconnected",
+		)
 	case webrtc.PeerConnectionStateFailed:
 		pc.state = PeerConnectionStateFailed
 		ConnectionMetrics.IncrementFailures()
-		log.Printf("webrtc: connection failed participant=%s", participantID)
+		pc.logger.Warn("webrtc connection failed",
+			"event", "connection_state",
+			"participant_id", participantID,
+			"state", "failed",
+			"error", "peer connection entered failed state",
+		)
 	case webrtc.PeerConnectionStateClosed:
 		pc.state = PeerConnectionStateClosed
-		log.Printf("webrtc: connection closed participant=%s", participantID)
+		pc.logger.Debug("webrtc connection closed",
+			"event", "connection_state",
+			"participant_id", participantID,
+			"state", "closed",
+		)
 	}
 }
 

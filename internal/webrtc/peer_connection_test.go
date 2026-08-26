@@ -1,6 +1,9 @@
 package webrtc
 
 import (
+	"errors"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -380,4 +383,90 @@ func TestWebRTCTrackSourceConversion(t *testing.T) {
 			t.Errorf("webrtcTrackSource(%v) = %v, want %v", tt.webrtcKind, got, tt.domainSource)
 		}
 	}
+}
+
+// TestPeerConnectionStateUsable pins the usability classification used by the
+// signaling layer's reconnect logic: Closed and Failed are terminal/unusable,
+// everything else — including Disconnected, where ICE may still self-heal —
+// is reusable.
+func TestPeerConnectionStateUsable(t *testing.T) {
+	tests := []struct {
+		state    PeerConnectionState
+		expected bool
+	}{
+		{PeerConnectionStateNew, true},
+		{PeerConnectionStateConnecting, true},
+		{PeerConnectionStateConnected, true},
+		{PeerConnectionStateDisconnected, true},
+		{PeerConnectionStateFailed, false},
+		{PeerConnectionStateClosed, false},
+	}
+
+	for _, tt := range tests {
+		if got := tt.state.Usable(); got != tt.expected {
+			t.Errorf("PeerConnectionState(%s).Usable() = %v, want %v", tt.state, got, tt.expected)
+		}
+	}
+}
+
+// TestNewPeerConnectionLoggerResolution verifies that a nil Logger in the
+// config resolves to slog.Default() and an explicit logger is carried over.
+func TestNewPeerConnectionLoggerResolution(t *testing.T) {
+	pcDefault := newNegotiationTestPeerConnectionWithConfig(t, "logger-default", "Logan", PeerConnectionConfig{})
+	if pcDefault.logger == nil {
+		t.Fatal("expected nil config.Logger to resolve to a non-nil default logger")
+	}
+
+	custom := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pcCustom := newNegotiationTestPeerConnectionWithConfig(t, "logger-custom", "Carla", PeerConnectionConfig{Logger: custom})
+	if pcCustom.logger != custom {
+		t.Error("expected the configured logger to be used as-is")
+	}
+}
+
+// TestOperationsOnFailedPCReturnErrPeerConnectionClosed drives the wrapper
+// into the Failed state through its own state-change handler and verifies the
+// failed-state operation contract (same guard the signaling layer relies on
+// when deciding to replace a connection on reconnect).
+func TestOperationsOnFailedPCReturnErrPeerConnectionClosed(t *testing.T) {
+	pc := newNegotiationTestPeerConnection(t, "failed-pc", "Finn")
+
+	pc.handleConnectionStateChange(webrtc.PeerConnectionStateFailed)
+
+	if pc.State() != PeerConnectionStateFailed {
+		t.Fatalf("state = %s, want failed", pc.State())
+	}
+	if !pc.NeedsReconnect() {
+		t.Error("failed state must report NeedsReconnect")
+	}
+
+	if err := pc.SetRemoteDescription(&SessionDescription{}); !errors.Is(err, ErrPeerConnectionClosed) {
+		t.Errorf("SetRemoteDescription error = %v, want ErrPeerConnectionClosed", err)
+	}
+	if err := pc.AddICECandidate(nil); !errors.Is(err, ErrPeerConnectionClosed) {
+		t.Errorf("AddICECandidate error = %v, want ErrPeerConnectionClosed", err)
+	}
+	if _, err := pc.CreateAnswer(nil); !errors.Is(err, ErrPeerConnectionClosed) {
+		t.Errorf("CreateAnswer error = %v, want ErrPeerConnectionClosed", err)
+	}
+}
+
+// newNegotiationTestPeerConnectionWithConfig is a configurable variant of
+// newNegotiationTestPeerConnection for tests that need specific config fields.
+func newNegotiationTestPeerConnectionWithConfig(t *testing.T, id, name string, config PeerConnectionConfig) *PeerConnection {
+	t.Helper()
+
+	config.SDPSemantics = webrtc.SDPSemanticsUnifiedPlanWithFallback
+
+	pc, err := NewPeerConnection(config, domain.NewParticipant(id, name), nil)
+	if err != nil {
+		t.Fatalf("Failed to create PeerConnection: %v", err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+
+	if _, err := pc.PionPeerConnection().AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
+		t.Fatalf("Failed to add transceiver: %v", err)
+	}
+
+	return pc
 }

@@ -2,7 +2,7 @@ package signaling
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -31,10 +31,18 @@ type Connection struct {
 	receiveChan   chan []byte
 	closeChan     chan struct{}
 	closeOnce     sync.Once
+	// logger is resolved at construction (nil becomes slog.Default()) and
+	// immutable afterwards; the read/write loops use it without locking.
+	logger *slog.Logger
 }
 
-// NewConnection creates a new Connection from an HTTP request.
-func NewConnection(w http.ResponseWriter, r *http.Request, roomID, participantID string) (*Connection, error) {
+// NewConnection creates a new Connection from an HTTP request. A nil logger
+// resolves to slog.Default().
+func NewConnection(logger *slog.Logger, w http.ResponseWriter, r *http.Request, roomID, participantID string) (*Connection, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
@@ -58,6 +66,7 @@ func NewConnection(w http.ResponseWriter, r *http.Request, roomID, participantID
 		sendChan:      make(chan []byte, 256),
 		receiveChan:   make(chan []byte, 256),
 		closeChan:     make(chan struct{}),
+		logger:        logger,
 	}
 
 	// Start read and write goroutines
@@ -167,7 +176,12 @@ func (c *Connection) readLoop() {
 			_, data, err := c.wsConn.ReadMessage()
 			if err != nil {
 				if !websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					log.Printf("WebSocket read error: %v", err)
+					c.logger.Warn("websocket read failed",
+						"event", "ws_read_failed",
+						"participant_id", c.participantID,
+						"room_id", c.roomID,
+						"error", err,
+					)
 				}
 				c.Close()
 				return
@@ -191,7 +205,12 @@ func (c *Connection) writeLoop() {
 		case data := <-c.sendChan:
 			if err := c.wsConn.WriteMessage(websocket.TextMessage, data); err != nil {
 				if !websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					log.Printf("WebSocket write error: %v", err)
+					c.logger.Warn("websocket write failed",
+						"event", "ws_write_failed",
+						"participant_id", c.participantID,
+						"room_id", c.roomID,
+						"error", err,
+					)
 				}
 				return
 			}
