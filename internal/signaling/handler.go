@@ -67,6 +67,31 @@ func NewHandler(roomManager *RoomManager, opts ...HandlerOption) *Handler {
 	return h
 }
 
+// Shutdown gracefully shuts down all WebSocket connections and peer connections
+// managed by this handler. It closes the connection manager (which sends orderly
+// close frames to all registered WS clients) and closes all tracked peer
+// connections. After this method returns, the handler should not be used for new
+// connections.
+func (h *Handler) Shutdown() error {
+	h.connectionManager.CloseAll()
+
+	h.peerConnectionsMutex.Lock()
+	defer h.peerConnectionsMutex.Unlock()
+
+	for id, pc := range h.peerConnections {
+		if err := pc.Close(); err != nil {
+			h.logger.Warn("failed to close peer connection during shutdown",
+				"event", "peer_connection_close_failed",
+				"participant_id", id,
+				"error", err,
+			)
+		}
+		delete(h.peerConnections, id)
+	}
+
+	return nil
+}
+
 // ServeHTTP implements http.Handler for WebSocket connections.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Extract room ID and participant ID from the request

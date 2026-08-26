@@ -10,9 +10,10 @@ import (
 
 // Server wraps an HTTP server with configuration and dependencies.
 type Server struct {
-	httpServer *http.Server
-	log        *logger.Logger
-	router     *Router
+	httpServer       *http.Server
+	log              *logger.Logger
+	router           *Router
+	signalingHandler http.Handler
 }
 
 // Option customises the HTTP server at construction time.
@@ -58,8 +59,9 @@ func NewServer(
 	router := NewRouter(cfg, deps)
 
 	return &Server{
-		log:    log,
-		router: router,
+		log:              log,
+		router:           router,
+		signalingHandler: applied.signalingHandler,
 		httpServer: &http.Server{
 			Addr:    cfg.HTTPAddr,
 			Handler: router.ServeMux(),
@@ -80,11 +82,19 @@ func (s *Server) Start() error {
 // Shutdown gracefully stops the HTTP server: the listener closes and
 // in-flight regular requests are drained.
 //
-// Note that net/http cannot track connections hijacked by WebSocket upgrades,
-// so Shutdown does not (and cannot) wait for active signaling sessions; they
-// are terminated when the process exits right after shutdown. Sending orderly
-// WebSocket close frames would require a shutdown seam inside the signaling
-// handler itself, which is outside this package's boundaries.
+// Before closing the HTTP listener, this method attempts to shut down the
+// signaling handler (if mounted) so that active WebSocket sessions receive
+// orderly close frames instead of being terminated with process exit.
 func (s *Server) Shutdown(ctx context.Context) error {
+	// Attempt to shut down the signaling handler if mounted, so that
+	// active WebSocket sessions receive orderly close frames.
+	if s.signalingHandler != nil {
+		if sh, ok := s.signalingHandler.(interface{ Shutdown() error }); ok {
+			if err := sh.Shutdown(); err != nil {
+				s.log.Warn("signaling shutdown failed", "error", err)
+			}
+		}
+	}
+
 	return s.httpServer.Shutdown(ctx)
 }
