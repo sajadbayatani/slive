@@ -2,11 +2,11 @@ APP_NAME := slive
 
 .PHONY: run
 run:
-	go run ./cmd/server
+	go run ./cmd/slive
 
 .PHONY: build
 build:
-	go build -o bin/$(APP_NAME) ./cmd/server
+	go build -o bin/$(APP_NAME) ./cmd/slive
 
 .PHONY: test
 test:

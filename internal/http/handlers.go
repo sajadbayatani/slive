@@ -12,6 +12,12 @@ type Logger interface {
 // This struct enables dependency injection for handlers.
 type HandlerDeps struct {
 	Log Logger
+	// SignalingHandler, when set, is mounted on the configured WebSocket
+	// path and upgrades clients to the signaling protocol. Injected rather
+	// than imported so the HTTP layer stays decoupled from the signaling
+	// package; deployments without signaling leave it nil and simply get
+	// no WebSocket route.
+	SignalingHandler http.Handler
 }
 
 // HealthHandler handles requests to the /health endpoint.

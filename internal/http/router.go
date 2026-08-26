@@ -40,6 +40,17 @@ func (r *Router) registerRoutes(cfg config.Config) {
 		healthPath = config.DefaultHealthPath
 	}
 	r.mux.Handle(healthPath, healthHandler)
+
+	// The WebSocket signaling endpoint is injected via HandlerDeps (see
+	// cmd/slive for the production wiring). The path comes from runtime
+	// configuration; the /health contract is unaffected either way.
+	if r.deps.SignalingHandler != nil {
+		wsPath := cfg.WebSocketPath
+		if wsPath == "" {
+			wsPath = config.DefaultWebSocketPath
+		}
+		r.mux.Handle(wsPath, r.deps.SignalingHandler)
+	}
 }
 
 // ServeMux returns the underlying http.ServeMux for use with the HTTP server.

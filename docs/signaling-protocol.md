@@ -12,7 +12,7 @@ This document provides the complete specification of the signaling protocol as i
 
 ### Transport
 - **Protocol**: WebSocket (RFC 6455)
-- **Path**: `/ws/{roomId}?room_id={roomId}&participant_id={participantId}`
+- **Path**: `/ws?room_id={roomId}&participant_id={participantId}` (path configurable via `WEBSOCKET_PATH`, default `/ws`)
 - **Message Format**: JSON
 - **Library**: `github.com/gorilla/websocket`
 
@@ -22,7 +22,8 @@ This document provides the complete specification of the signaling protocol as i
 2. **Authentication**: Currently uses query parameters (TODO: Implement proper authentication)
 3. **Room Assignment**: Server gets or creates room, gets or creates participant
 4. **Message Processing**: Server processes incoming messages and routes to appropriate handlers
-5. **Cleanup**: On connection close, participant is removed from room and notifications are broadcast
+5. **Reconnect semantics**: If the WebSocket drops, the participant AND its peer connection stay alive so a reconnecting client resumes its media session (the peer connection's signaling output is re-bound to the newest socket)
+6. **Cleanup**: An explicit `leave_room` removes the participant from the room and tears down (closes + deregisters) its peer connection; other participants receive `participant_left`
 
 ### Message Structure
 
@@ -296,7 +297,13 @@ The `data` field contains the message-specific payload as JSON.
 
 ### 5. Session Negotiation (WebRTC SDP Exchange)
 
-#### Offer Exchange
+Slive's server terminates media: it owns one peer connection per participant
+and answers offers **on behalf of the target peer connection** (SFU-style),
+rather than relaying SDP verbatim between clients. All negotiation messages
+carry a `target_participant_id` that selects whose server-side peer connection
+the message is applied to.
+
+#### Offer
 
 **Offer (Client → Server)**:
 ```json
@@ -306,23 +313,34 @@ The `data` field contains the message-specific payload as JSON.
     "room_id": "room-id",
     "participant_id": "participant-id",
     "target_participant_id": "target-participant-id",
-    "sdp": "base64-encoded-sdp",
+    "sdp": "sdp-offer",
     "track_ids": ["track-id-1", "track-id-2"]
   }
 }
 ```
 
-**Server Relay (Server → Target Client)**:
+**Server behaviour**: the offer is installed on the *target* participant's
+peer connection (`SetRemoteDescription`). The server then generates an answer
+(`CreateAnswer`, waiting for ICE gathering so the SDP is complete) and sends
+it back to the **source** connection:
+
 ```json
 {
-  "type": "webrtc:offer",
+  "type": "webrtc:answer",
   "data": {
-    "source_participant_id": "participant-id",
-    "sdp": "base64-encoded-sdp",
-    "track_ids": ["track-id-1", "track-id-2"]
+    "source_participant_id": "target-participant-id",
+    "sdp": "sdp-answer-generated-by-server"
   }
 }
 ```
+
+Errors are reported to the source client as `error` messages carrying mapped
+codes (`participant_not_found` for unknown targets, `connection_not_found`
+when the target has no live peer connection, `invalid_webrtc_message` for
+unparsable SDP, `negotiation_failed` / `peer_connection_closed` for failed
+application).
+
+#### Answer
 
 **Answer (Client → Server)**:
 ```json
@@ -332,26 +350,14 @@ The `data` field contains the message-specific payload as JSON.
     "room_id": "room-id",
     "participant_id": "participant-id",
     "target_participant_id": "target-participant-id",
-    "sdp": "base64-encoded-sdp"
+    "sdp": "sdp-answer"
   }
 }
 ```
 
-**Server Relay (Server → Source Client)**:
-```json
-{
-  "type": "webrtc:answer",
-  "data": {
-    "source_participant_id": "target-participant-id",
-    "sdp": "base64-encoded-sdp"
-  }
-}
-```
-
-**Implementation Notes**:
-- Server acts as a relay for SDP messages between participants
-- Uses `ConnectionManager` to find target connection
-- Returns `ErrConnectionNotFound` if target participant is not connected
+**Server behaviour**: the answer is applied as the remote description of the
+*target* participant's peer connection (`SetRemoteDescription`). No message is
+relayed to other clients.
 
 #### ICE Candidate Exchange
 
@@ -363,25 +369,22 @@ The `data` field contains the message-specific payload as JSON.
     "room_id": "room-id",
     "participant_id": "participant-id",
     "target_participant_id": "target-participant-id",
-    "candidate": "base64-encoded-candidate",
+    "candidate": "candidate-string",
     "sdp_mid": "mid",
     "sdp_mline_index": 0
   }
 }
 ```
 
-**Server Relay (Server → Target Client)**:
-```json
-{
-  "type": "webrtc:ice-candidate",
-  "data": {
-    "source_participant_id": "participant-id",
-    "candidate": "base64-encoded-candidate",
-    "sdp_mid": "mid",
-    "sdp_mline_index": 0
-  }
-}
-```
+**Server behaviour**: the candidate is added to the *target* participant's
+peer connection with bounded retries for transient failures
+(`AddICECandidateWithRetry`). Exhausted retries report `ice_failed` wrapping
+the underlying cause (e.g. `peer_connection_closed`).
+
+Outbound events flow the opposite way: whenever the server-side peer
+connection needs renegotiation or gathers a local ICE candidate, it pushes a
+`webrtc:offer` / `webrtc:ice-candidate` message through the owning
+participant's WebSocket automatically — clients do not need to poll.
 
 ---
 
@@ -405,6 +408,11 @@ The `data` field contains the message-specific payload as JSON.
 - `participant_not_found` - Participant does not exist
 - `track_not_found` - Track does not exist
 - `invalid_request` - Malformed or invalid request
+- `invalid_webrtc_message` - WebRTC payload (SDP/ICE) could not be parsed or applied
+- `connection_not_found` - Target participant has no registered connection / peer connection
+- `peer_connection_closed` - Target peer connection is closed
+- `negotiation_failed` - SDP negotiation (offer/answer processing) failed
+- `ice_failed` - ICE candidate could not be applied before retries ran out
 - `internal_error` - Internal server error
 
 ---
@@ -537,21 +545,28 @@ sequenceDiagram
     Server->>Server: Broadcast track_available to other participants
 ```
 
-### Example 2: WebRTC Offer/Answer Exchange
+### Example 2: WebRTC Offer/Answer Exchange (server-side answering)
 
 ```mermaid
 sequenceDiagram
     participant ClientA
     participant Server
-    participant ClientB
+    participant PCB as Server PC (B)
 
-    ClientA->>Server: webrtc:offer {target: "p2", sdp: "...", track_ids: ["t1"]}
-    Server->>ClientB: webrtc:offer {source: "p1", sdp: "...", track_ids: ["t1"]}
-    ClientB->>Server: webrtc:answer {target: "p1", sdp: "..."}
-    Server->>ClientA: webrtc:answer {source: "p2", sdp: "..."}
+    Note over Server,PCB: The server owns one peer connection per participant.
+    ClientA->>Server: webrtc:offer {target: "p2", sdp: "..."}
+    Server->>PCB: SetRemoteDescription(offer)
+    Server->>PCB: CreateAnswer (+ ICE gathering)
+    Server->>ClientA: webrtc:answer {source: "p2", sdp: server-generated}
     ClientA->>Server: webrtc:ice-candidate {target: "p2", candidate: "..."}
-    Server->>ClientB: webrtc:ice-candidate {source: "p1", candidate: "..."}
+    Server->>PCB: AddICECandidateWithRetry(candidate)
+    PCB-->>ClientA: webrtc:offer / webrtc:ice-candidate (automatic push on renegotiation/gathering)
 ```
+
+Note the asymmetry with classic client-to-client WebRTC: the answer is always
+generated by the server on behalf of the target peer connection and delivered
+to the offering client. Media itself flows over the per-participant peer
+connections terminated by the server (SFU-style).
 
 ---
 

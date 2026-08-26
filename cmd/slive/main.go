@@ -10,6 +10,8 @@ import (
 	"github.com/sajadbayatani/slive/internal/config"
 	apphttp "github.com/sajadbayatani/slive/internal/http"
 	"github.com/sajadbayatani/slive/internal/logger"
+	"github.com/sajadbayatani/slive/internal/signaling"
+	webrtc "github.com/sajadbayatani/slive/internal/webrtc"
 )
 
 func main() {
@@ -17,7 +19,9 @@ func main() {
 
 	log := logger.New()
 
-	server := apphttp.NewServer(cfg, log)
+	server := apphttp.NewServer(cfg, log,
+		apphttp.WithSignalingHandler(newSignalingHandler(cfg, log)),
+	)
 
 	go func() {
 		log.Info("starting server", "addr", cfg.HTTPAddr)
@@ -52,4 +56,43 @@ func main() {
 	}
 
 	log.Info("server stopped")
+}
+
+// newSignalingHandler wires the WebSocket signaling endpoint with runtime
+// configuration: ICE servers are translated from STUN_SERVERS/TURN_SERVERS
+// and the application's structured logger is propagated into every peer
+// connection and signaling session.
+func newSignalingHandler(cfg config.Config, log *logger.Logger) *signaling.Handler {
+	return signaling.NewHandler(
+		signaling.NewRoomManager(),
+		signaling.WithPeerConnectionConfig(buildPeerConnectionConfig(cfg)),
+		signaling.WithLogger(log.Logger),
+	)
+}
+
+// buildPeerConnectionConfig translates application configuration into the
+// PeerConnectionConfig used for every peer connection this server creates.
+// When no ICE servers are configured, the webrtc package defaults apply.
+func buildPeerConnectionConfig(cfg config.Config) webrtc.PeerConnectionConfig {
+	pcConfig := webrtc.DefaultPeerConnectionConfig()
+
+	if iceServers := webrtc.ICEServersFromURLs(cfg.STUNServers, turnServersFromConfig(cfg.TURNServers)); len(iceServers) > 0 {
+		pcConfig.ICEServers = iceServers
+	}
+
+	return pcConfig
+}
+
+// turnServersFromConfig maps parsed TURN configuration onto the ICE-server
+// representation expected by the webrtc package.
+func turnServersFromConfig(servers []config.TURNServer) []webrtc.ICETurnServer {
+	out := make([]webrtc.ICETurnServer, 0, len(servers))
+	for _, server := range servers {
+		out = append(out, webrtc.ICETurnServer{
+			URLs:       server.URLs,
+			Username:   server.Username,
+			Credential: server.Credential,
+		})
+	}
+	return out
 }

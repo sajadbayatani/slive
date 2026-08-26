@@ -24,7 +24,8 @@ This document describes the architecture of Slive, a self-hosted real-time commu
 │  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
 │  │  │                       http.Router                                  │  │  │
 │  │  │  - /health → HealthHandler (liveness check)                      │  │  │
-│  │  │  - /ws/{roomId} → signaling.Handler (WebSocket upgrade)          │  │  │
+│  │  │  - /ws?room_id=&participant_id= → signaling.Handler              │  │  │
+│  │  │    (WebSocket upgrade; WEBSOCKET_PATH configurable)              │  │  │
 │  │  └─────────────────────────────────────────────────────────────────┘  │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                                                                             │
@@ -91,9 +92,16 @@ The HTTP layer provides the entry point for all client connections and API endpo
 #### Router (`http.Router`)
 - Central route registration using `http.ServeMux`
 - Separates route configuration from server setup
-- Currently registers:
+- Registers:
   - `/health` - Health check endpoint
-  - WebSocket routes (via signaling handler)
+  - `/ws` - WebSocket signaling endpoint (`WEBSOCKET_PATH`, default `/ws`)
+
+The signaling handler is injected into the router via `HandlerDeps.SignalingHandler`
+(set through `apphttp.WithSignalingHandler` in `cmd/slive`), so the HTTP layer
+does not import the signaling package and minimal deployments can omit the
+route entirely. `cmd/slive` builds the handler with the runtime ICE-server
+configuration (`STUN_SERVERS`/`TURN_SERVERS` → `webrtc.ICEServersFromURLs`)
+and propagates the structured logger via `signaling.WithLogger`.
 
 #### Health Handler (`http.HealthHandler`)
 - Simple liveness probe endpoint
@@ -262,7 +270,7 @@ created → published → unpublished
 
 ### Message Processing Pipeline
 
-1. **WebSocket Upgrade**: Client connects to `/ws/{roomId}?room_id=...&participant_id=...`
+1. **WebSocket Upgrade**: Client connects to `/ws?room_id=...&participant_id=...`
 2. **Connection Creation**: `NewConnection()` creates WebSocket connection wrapper
 3. **Room Assignment**: Handler gets or creates room via `RoomManager.GetOrCreateRoom()`
 4. **Participant Assignment**: Handler gets or creates participant, joins to room
@@ -371,21 +379,27 @@ flowchart TD
 
 ### WebRTC Signaling Flow
 
+The server terminates media SFU-style: it owns one peer connection per
+participant and answers offers **on behalf of the target peer connection**
+instead of relaying SDP verbatim between clients.
+
 ```mermaid
 flowchart TD
-    A[Client A: offer] -->|WebSocket| B[Handler.handleOffer]
-    B --> C[Find target participant]
-    C --> D[Find target connection]
-    D --> E[Create OfferNotification]
-    E --> F[targetConn.Send]
-    F --> G[Client B: offer notification]
-    G --> H[Client B: answer]
-    H --> I[Handler.handleAnswer]
-    I --> J[Find source connection]
-    J --> K[Create AnswerNotification]
-    K --> L[sourceConn.Send]
-    L --> M[Client A: answer notification]
+    A[Client A: offer targeted at B] -->|WebSocket| B[Handler.handleOffer]
+    B --> C[Resolve target participant + peer connection]
+    C --> D[SetRemoteDescription offer on B's PC]
+    D --> E[CreateAnswer on B's PC incl. ICE gathering]
+    E --> F[AnswerNotification to source]
+    F --> G[Client A: webrtc:answer with server-generated SDP]
+    G --> H[Client A: webrtc:ice-candidate targeted at B]
+    H --> I[Handler.handleICECandidate]
+    I --> J[AddICECandidateWithRetry on B's PC]
 ```
+
+Outbound events are pushed automatically: when a server-side peer connection
+needs renegotiation or gathers local ICE candidates, it sends
+`webrtc:offer` / `webrtc:ice-candidate` through the owning participant's
+WebSocket (the sender is re-bound on reconnect).
 
 ---
 
@@ -411,7 +425,10 @@ Client: error message
 
 ### Error Code Mapping
 
-| Domain Error | Signaling Error Code |
+Domain errors are mapped via `errorCodeFromDomainError`; WebRTC and transport
+errors are mapped via `errorCodeFromError` (both in `internal/signaling`).
+
+| Error | Signaling Error Code |
 |--------------|----------------------|
 | `ErrRoomClosed` | `room_closed` |
 | `ErrParticipantNotFound` | `participant_not_found` |
@@ -419,13 +436,24 @@ Client: error message
 | `ErrParticipantAlreadyExists` | `internal_error` |
 | `ErrTrackAlreadyPublished` | `internal_error` |
 | `ErrTrackAlreadySubscribed` | `internal_error` |
+| validation failures (`ErrInvalidRequest`) | `invalid_request` |
+| `signaling.ErrConnectionNotFound` / `webrtc.ErrNoPeerConnection` | `connection_not_found` |
+| `webrtc.ErrICEFailed` (retries exhausted) | `ice_failed` |
+| `webrtc.ErrPeerConnectionClosed` | `peer_connection_closed` |
+| `webrtc.ErrNegotiationFailed` | `negotiation_failed` |
+| `webrtc.ErrInvalidSDP` / `ErrInvalidICECandidate` / `ErrTrackNotReady` | `invalid_webrtc_message` |
 
 ### Connection Error Handling
 
 1. **Read Error**: Log error, break message loop, trigger cleanup
 2. **Write Error**: Log error, close connection, trigger cleanup
-3. **Connection Close**: Remove from ConnectionManager, leave room, broadcast participant_left
-4. **Panic**: Recover in goroutine, log error, close connection
+3. **WebSocket drop**: The transport registry entry is removed, but the
+   participant and its peer connection stay alive for reconnection
+   (`event=peer_disconnected`); the next join from the same participant ID
+   reuses the live peer connection with a freshly bound signaling sender
+4. **Explicit `leave_room`**: Terminal — removes the participant from the room,
+   closes and deregisters the peer connection, broadcasts `participant_left`
+5. **Panic**: Recover in goroutine, log error, close connection
 
 ---
 
@@ -434,25 +462,28 @@ Client: error message
 ### Connection Cleanup
 
 ```text
-Connection Closed
+WebSocket transport drops (reconnectable)
     │
-    ├── ConnectionManager.Remove(conn.ID())
+    ├── ConnectionManager.RemoveIf(conn.ID(), conn)
     │
     ├── conn.Close()
     │
-    ├── Handler.handleConnectionClosed()
-    │       │
-    │       ├── room.Leave(participant.ID())
-    │       │
-    │       └── Handler.broadcastParticipantLeft()
+    └── Handler.handleConnectionClosed()
+            │
+            └── log event=peer_disconnected (participant + peer
+                connection deliberately kept alive for rejoin)
+
+Explicit leave_room (terminal)
     │
-    └── Participant.Leave()
+    ├── room.Leave(participantID)
+    │
+    ├── Handler.closePeerConnection(participantID)
+    │       │
+    │       └── peer connection closed + removed from handler registry
+    │
+    └── Handler.broadcastParticipantLeft()
             │
-            ├── Clear pubTracks map
-            │
-            ├── Clear subTracks map
-            │
-            └── Set room reference to nil
+            └── Other clients: participant_left
 ```
 
 ### Room Cleanup
