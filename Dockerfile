@@ -9,7 +9,7 @@ COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -o /bin/slive \
-    ./cmd/server
+    ./cmd/slive
 
 
 FROM gcr.io/distroless/static-debian12
