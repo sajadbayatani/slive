@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 )
@@ -18,7 +19,7 @@ func TestRoomConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			participant := NewParticipant("participant-"+string(rune(id)), "User")
+			participant := NewParticipant(fmt.Sprintf("participant-%d", id), "User")
 			_ = room.Join(participant)
 		}(i)
 	}
@@ -28,7 +29,7 @@ func TestRoomConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			_ = room.Leave("participant-" + string(rune(id)))
+			_ = room.Leave(fmt.Sprintf("participant-%d", id))
 		}(i)
 	}
 
@@ -52,7 +53,7 @@ func TestParticipantConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			track := newValidTrack(t, "track-"+string(rune(id)), TrackKindAudio, TrackSourceMicrophone)
+			track := newValidTrack(t, fmt.Sprintf("track-%d", id), TrackKindAudio, TrackSourceMicrophone)
 			_ = participant.PublishTrack(track)
 		}(i)
 	}
@@ -62,7 +63,7 @@ func TestParticipantConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			track := newValidTrack(t, "track-"+string(rune(id)), TrackKindVideo, TrackSourceCamera)
+			track := newValidTrack(t, fmt.Sprintf("track-%d", id), TrackKindVideo, TrackSourceCamera)
 			_ = participant.SubscribeTrack(track)
 		}(i)
 	}
@@ -113,9 +114,9 @@ func TestRoomParticipantConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			participant := NewParticipant("participant-"+string(rune(id)), "User")
+			participant := NewParticipant(fmt.Sprintf("participant-%d", id), "User")
 			_ = room.Join(participant)
-			_ = room.Leave("participant-" + string(rune(id)))
+			_ = room.Leave(fmt.Sprintf("participant-%d", id))
 		}(i)
 	}
 
@@ -149,9 +150,9 @@ func TestParticipantTrackConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			track := newValidTrack(t, "track-"+string(rune(id)), TrackKindAudio, TrackSourceMicrophone)
+			track := newValidTrack(t, fmt.Sprintf("track-%d", id), TrackKindAudio, TrackSourceMicrophone)
 			_ = participant.PublishTrack(track)
-			_ = participant.UnpublishTrack("track-" + string(rune(id)))
+			_ = participant.UnpublishTrack(fmt.Sprintf("track-%d", id))
 		}(i)
 	}
 
@@ -160,9 +161,9 @@ func TestParticipantTrackConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			track := newValidTrack(t, "track-"+string(rune(id)), TrackKindVideo, TrackSourceCamera)
+			track := newValidTrack(t, fmt.Sprintf("track-%d", id), TrackKindVideo, TrackSourceCamera)
 			_ = participant.SubscribeTrack(track)
-			_ = participant.UnsubscribeTrack("track-" + string(rune(id)))
+			_ = participant.UnsubscribeTrack(fmt.Sprintf("track-%d", id))
 		}(i)
 	}
 
