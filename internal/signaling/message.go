@@ -26,14 +26,16 @@ const (
 	MessageTypeParticipantLeft   MessageType = "participant_left"
 
 	// Track messages
-	MessageTypePublishTrack     MessageType = "publish_track"
-	MessageTypeTrackPublished   MessageType = "track_published"
-	MessageTypeUnpublishTrack   MessageType = "unpublish_track"
-	MessageTypeTrackUnpublished MessageType = "track_unpublished"
-	MessageTypeSubscribeTrack   MessageType = "subscribe_track"
-	MessageTypeTrackSubscribed  MessageType = "track_subscribed"
-	MessageTypeTrackAvailable   MessageType = "track_available"
-	MessageTypeTrackUnavailable MessageType = "track_unavailable"
+	MessageTypePublishTrack      MessageType = "publish_track"
+	MessageTypeTrackPublished    MessageType = "track_published"
+	MessageTypeUnpublishTrack    MessageType = "unpublish_track"
+	MessageTypeTrackUnpublished  MessageType = "track_unpublished"
+	MessageTypeSubscribeTrack    MessageType = "subscribe_track"
+	MessageTypeTrackSubscribed   MessageType = "track_subscribed"
+	MessageTypeUnsubscribeTrack  MessageType = "unsubscribe_track"
+	MessageTypeTrackUnsubscribed MessageType = "track_unsubscribed"
+	MessageTypeTrackAvailable    MessageType = "track_available"
+	MessageTypeTrackUnavailable  MessageType = "track_unavailable"
 
 	// WebRTC signaling messages
 	MessageTypeOffer        MessageType = "webrtc:offer"
@@ -202,6 +204,20 @@ type TrackSubscribedResponse struct {
 	TrackID     string `json:"track_id"`
 	PublisherID string `json:"publisher_id"`
 	Status      string `json:"status"`
+}
+
+// UnsubscribeTrackRequest represents a request to unsubscribe from a track.
+type UnsubscribeTrackRequest struct {
+	RoomID        string `json:"room_id"`
+	ParticipantID string `json:"participant_id"`
+	TrackID       string `json:"track_id"`
+}
+
+// TrackUnsubscribedResponse represents a response to an unsubscribe track request.
+type TrackUnsubscribedResponse struct {
+	TrackID       string `json:"track_id"`
+	ParticipantID string `json:"participant_id"`
+	Status        string `json:"status"`
 }
 
 // OfferRequest represents a WebRTC offer.

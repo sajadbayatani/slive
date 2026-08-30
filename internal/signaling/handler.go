@@ -17,6 +17,9 @@ type Handler struct {
 	connectionManager    *ConnectionManager
 	peerConnections      map[string]*webrtc.PeerConnection
 	peerConnectionsMutex sync.RWMutex
+	// trackForwarders holds the SFU forwarding state keyed by track ID.
+	trackForwarders      map[string]*webrtc.TrackForwarder
+	trackForwardersMutex sync.RWMutex
 	// peerConnectionConfig is used for every peer connection this handler
 	// creates; it defaults to DefaultPeerConnectionConfig() and can be
 	// overridden with WithPeerConnectionConfig.
@@ -56,6 +59,7 @@ func NewHandler(roomManager *RoomManager, opts ...HandlerOption) *Handler {
 		roomManager:          roomManager,
 		connectionManager:    NewConnectionManager(),
 		peerConnections:      make(map[string]*webrtc.PeerConnection),
+		trackForwarders:      make(map[string]*webrtc.TrackForwarder),
 		peerConnectionConfig: webrtc.DefaultPeerConnectionConfig(),
 		logger:               slog.Default(),
 	}
@@ -74,6 +78,21 @@ func NewHandler(roomManager *RoomManager, opts ...HandlerOption) *Handler {
 // connections.
 func (h *Handler) Shutdown() error {
 	h.connectionManager.CloseAll()
+
+	// Stop all forwarders first: forwarder.Stop() removes the forwarded track
+	// from every subscriber PC, so do it before closing the PCs themselves.
+	h.trackForwardersMutex.Lock()
+	for trackID, fw := range h.trackForwarders {
+		if err := fw.Stop(); err != nil {
+			h.logger.Warn("failed to stop forwarder during shutdown",
+				"event", "forwarder_stop_failed",
+				"track_id", trackID,
+				"error", err,
+			)
+		}
+		delete(h.trackForwarders, trackID)
+	}
+	h.trackForwardersMutex.Unlock()
 
 	h.peerConnectionsMutex.Lock()
 	defer h.peerConnectionsMutex.Unlock()
@@ -256,7 +275,7 @@ func (h *Handler) handleConnection(conn *Connection) {
 			)
 			_ = conn.Send(MessageTypeError, ErrorResponse{
 				Error:       err.Error(),
-				Code:        errorCodeFromDomainError(err),
+				Code:        errorCodeFromError(err),
 				RequestType: string(msg.Type),
 			})
 		}
@@ -300,7 +319,200 @@ func (h *Handler) ensurePeerConnection(participant *domain.Participant, sender w
 	h.peerConnections[participant.ID()] = pc
 	h.peerConnectionsMutex.Unlock()
 
+	// SFU hook: when this participant publishes a track (local or remote),
+	// lazily create/start the forwarder so later subscribers can attach.
+	pc.OnLocalTrackAdded(func(track *webrtc.WebRTCTrack) {
+		if track == nil {
+			return
+		}
+		if _, err := h.getOrCreateForwarder(track.ID(), track); err != nil {
+			h.logger.Warn("failed to create forwarder via OnLocalTrackAdded",
+				"event", "forwarder_create_failed",
+				"participant_id", participant.ID(),
+				"track_id", track.ID(),
+				"error", err,
+			)
+		}
+	})
+	pc.OnTrack(func(track *webrtc.WebRTCTrack) {
+		if track == nil {
+			return
+		}
+		if _, err := h.getOrCreateForwarder(track.ID(), track); err != nil {
+			h.logger.Warn("failed to create forwarder via OnTrack",
+				"event", "forwarder_create_failed",
+				"participant_id", participant.ID(),
+				"track_id", track.ID(),
+				"error", err,
+			)
+		}
+	})
+
 	return pc, nil
+}
+
+// --- SFU forwarder registry helpers ---
+
+// getForwarder returns the forwarder for trackID if it exists.
+func (h *Handler) getForwarder(trackID string) *webrtc.TrackForwarder {
+	h.trackForwardersMutex.RLock()
+	defer h.trackForwardersMutex.RUnlock()
+	return h.trackForwarders[trackID]
+}
+
+// getOrCreateForwarder returns the existing forwarder for trackID or creates
+// one backed by publisherTrack and starts it. Thread-safe.
+//
+// If a forwarder already exists but is bound to a TrackLocal placeholder
+// while publisherTrack is a real TrackRemote, the publisher is swapped via
+// TrackForwarder.UpdatePublisher so that the forwarding loop pumps real RTP
+// instead of staying stuck on the dummy track that exited immediately.
+func (h *Handler) getOrCreateForwarder(trackID string, publisherTrack *webrtc.WebRTCTrack) (*webrtc.TrackForwarder, error) {
+	if publisherTrack == nil {
+		return nil, webrtc.ErrTrackNotReady
+	}
+	// Fast path: already exists. Handle placeholder → real swap.
+	h.trackForwardersMutex.RLock()
+	if fw := h.trackForwarders[trackID]; fw != nil {
+		h.trackForwardersMutex.RUnlock()
+		if publisherTrack.IsRemote() {
+			if pt := fw.PublisherTrack(); pt != nil && !pt.IsRemote() {
+				if err := fw.UpdatePublisher(publisherTrack); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return fw, nil
+	}
+	h.trackForwardersMutex.RUnlock()
+
+	h.trackForwardersMutex.Lock()
+	defer h.trackForwardersMutex.Unlock()
+	if fw := h.trackForwarders[trackID]; fw != nil {
+		if publisherTrack.IsRemote() {
+			if pt := fw.PublisherTrack(); pt != nil && !pt.IsRemote() {
+				if err := fw.UpdatePublisher(publisherTrack); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return fw, nil
+	}
+	fw, err := webrtc.NewTrackForwarder(publisherTrack)
+	if err != nil {
+		return nil, err
+	}
+	if err := fw.Start(); err != nil {
+		return nil, err
+	}
+	h.trackForwarders[trackID] = fw
+	return fw, nil
+}
+
+// removeForwarder stops the forwarder for trackID and removes it from the registry.
+func (h *Handler) removeForwarder(trackID string) {
+	h.trackForwardersMutex.Lock()
+	fw, exists := h.trackForwarders[trackID]
+	if exists {
+		delete(h.trackForwarders, trackID)
+	}
+	h.trackForwardersMutex.Unlock()
+	if exists {
+		_ = fw.Stop()
+	}
+}
+
+// removeSubscriberFromForwarder removes pc as subscriber from forwarder for trackID.
+// If the forwarder has no more subscribers it is stopped and removed.
+func (h *Handler) removeSubscriberFromForwarder(trackID string, pc *webrtc.PeerConnection) {
+	if pc == nil {
+		return
+	}
+	h.trackForwardersMutex.RLock()
+	fw := h.trackForwarders[trackID]
+	h.trackForwardersMutex.RUnlock()
+	if fw == nil {
+		return
+	}
+	_ = fw.RemoveSubscriber(pc)
+	if fw.SubscriberCount() == 0 {
+		// Keep publisher forwarder alive until explicit unpublish/leave.
+		// Spec says stop and remove when no more subscribers; we do so only
+		// for unsubscribe path where publisher still alive. For publisher
+		// teardown, removeForwarder already handles stopping regardless.
+		// To honor spec, stop and remove on last unsubscribe.
+		h.trackForwardersMutex.Lock()
+		// Re-check under write lock that count is still zero and entry is same.
+		if cur := h.trackForwarders[trackID]; cur == fw && fw.SubscriberCount() == 0 {
+			delete(h.trackForwarders, trackID)
+			h.trackForwardersMutex.Unlock()
+			_ = fw.Stop()
+			return
+		}
+		h.trackForwardersMutex.Unlock()
+	}
+}
+
+// removeSubscriberFromAllForwarders removes pc from every forwarder (leave path).
+func (h *Handler) removeSubscriberFromAllForwarders(pc *webrtc.PeerConnection) {
+	if pc == nil {
+		return
+	}
+	h.trackForwardersMutex.RLock()
+	fws := make([]*webrtc.TrackForwarder, 0, len(h.trackForwarders))
+	ids := make([]string, 0, len(h.trackForwarders))
+	for id, fw := range h.trackForwarders {
+		fws = append(fws, fw)
+		ids = append(ids, id)
+	}
+	h.trackForwardersMutex.RUnlock()
+	for i, fw := range fws {
+		_ = fw.RemoveSubscriber(pc)
+		if fw.SubscriberCount() == 0 {
+			// Only auto-remove subscriber-only forwarders; publisher
+			// forwarder cleanup is handled by removeForwarder on unpublish/leave.
+			// Check if publisher still alive: if forwarder still has publisher
+			// track published, keep it. For leave cleanup we explicitly handle
+			// publisher forwarders elsewhere. Here we stop idle forwarders.
+			h.trackForwardersMutex.Lock()
+			if cur := h.trackForwarders[ids[i]]; cur == fw && fw.SubscriberCount() == 0 {
+				// If publisher track still exists in room, don't auto-remove;
+				// but spec says to stop and remove when no subscribers.
+				// We remove to avoid leaking idle forwarders.
+				delete(h.trackForwarders, ids[i])
+				h.trackForwardersMutex.Unlock()
+				_ = fw.Stop()
+			} else {
+				h.trackForwardersMutex.Unlock()
+			}
+		}
+	}
+}
+
+// createPublisherWebRTCTrack builds a WebRTCTrack wrapping domainTrack with a
+// Pion TrackLocalStaticRTP suitable for AddTrack. Codec is inferred from kind.
+func (h *Handler) createPublisherWebRTCTrack(domainTrack *domain.Track) (*webrtc.WebRTCTrack, error) {
+	var capability pionwebrtc.RTPCodecCapability
+	switch domainTrack.Kind() {
+	case domain.TrackKindAudio:
+		capability = pionwebrtc.RTPCodecCapability{
+			MimeType:    pionwebrtc.MimeTypeOpus,
+			ClockRate:   48000,
+			Channels:    2,
+			SDPFmtpLine: "",
+		}
+	default:
+		capability = pionwebrtc.RTPCodecCapability{
+			MimeType:  pionwebrtc.MimeTypeVP8,
+			ClockRate: 90000,
+		}
+	}
+	pionTrack, err := pionwebrtc.NewTrackLocalStaticRTP(capability, domainTrack.ID(), domainTrack.ID()+"-stream")
+	if err != nil {
+		return nil, err
+	}
+	codecParams := pionwebrtc.RTPCodecParameters{RTPCodecCapability: capability}
+	return webrtc.NewWebRTCTrack(domainTrack, pionTrack, codecParams), nil
 }
 
 // handleMessage handles a single message from a connection.
@@ -323,6 +535,9 @@ func (h *Handler) handleMessage(conn *Connection, room *domain.Room, participant
 
 	case MessageTypeSubscribeTrack:
 		return h.handleSubscribeTrack(conn, room, participant, msg)
+
+	case MessageTypeUnsubscribeTrack:
+		return h.handleUnsubscribeTrack(conn, room, participant, msg)
 
 	case MessageTypeOffer:
 		return h.handleOffer(conn, room, participant, msg)
@@ -400,9 +615,23 @@ func (h *Handler) handleLeaveRoom(conn *Connection, room *domain.Room, participa
 		return err
 	}
 
+	// Snapshot SFU state before room.Leave clears participant bookkeeping.
+	publishedTracks := participant.PublishedTracks()
+	// Resolve subscriber PC before it is removed.
+	leaverPC := h.getPeerConnection(req.ParticipantID)
+
 	// Remove participant from room
 	if err := room.Leave(req.ParticipantID); err != nil {
 		return err
+	}
+
+	// Publisher teardown: stop forwarders for tracks this participant published.
+	for _, trackID := range publishedTracks {
+		h.removeForwarder(trackID)
+	}
+	// Subscriber teardown: detach leaver from every forwarder it subscribed to.
+	if leaverPC != nil {
+		h.removeSubscriberFromAllForwarders(leaverPC)
 	}
 
 	// Tear down the peer connection: an explicit leave does not get to
@@ -487,6 +716,49 @@ func (h *Handler) handlePublishTrack(conn *Connection, room *domain.Room, partic
 		return err
 	}
 
+	// SFU wiring: ensure a forwarder exists so subscribers can attach.
+	// We create a standalone WebRTCTrack (not added to publisher PC) to avoid
+	// spurious negotiation on the publisher side; real media arrives via
+	// OnTrack and the forwarder will forward via WriteRTP. If a local track
+	// already exists on the publisher PC (e.g. from a previous AddTrack via
+	// another path), prefer that track as the forwarder source.
+	if h.getForwarder(track.ID()) == nil {
+		// Prefer an existing local track on the publisher PC if present.
+		var publisherWebTrack *webrtc.WebRTCTrack
+		if pc := h.getPeerConnection(participant.ID()); pc != nil {
+			publisherWebTrack = pc.GetLocalTrack(track.ID())
+		}
+		if publisherWebTrack == nil {
+			webTrack, err := h.createPublisherWebRTCTrack(track)
+			if err != nil {
+				h.logger.Warn("failed to create publisher web track",
+					"event", "publisher_track_create_failed",
+					"participant_id", participant.ID(),
+					"track_id", track.ID(),
+					"error", err,
+				)
+			} else {
+				if _, err := h.getOrCreateForwarder(track.ID(), webTrack); err != nil {
+					h.logger.Warn("failed to create forwarder for publisher track",
+						"event", "forwarder_create_failed",
+						"participant_id", participant.ID(),
+						"track_id", track.ID(),
+						"error", err,
+					)
+				}
+			}
+		} else {
+			if _, err := h.getOrCreateForwarder(track.ID(), publisherWebTrack); err != nil {
+				h.logger.Warn("failed to ensure forwarder for existing publisher track",
+					"event", "forwarder_ensure_failed",
+					"participant_id", participant.ID(),
+					"track_id", track.ID(),
+					"error", err,
+				)
+			}
+		}
+	}
+
 	// Send response
 	resp := TrackPublishedResponse{
 		TrackID:       req.Track.ID,
@@ -522,6 +794,13 @@ func (h *Handler) handleUnpublishTrack(conn *Connection, room *domain.Room, part
 		return err
 	}
 
+	// SFU teardown: stop forwarder and clean subscriber PCs.
+	h.removeForwarder(req.TrackID)
+	// Also remove local track from publisher PC if present (forwarder.Stop already did, but handle idempotent case).
+	if pc := h.getPeerConnection(participant.ID()); pc != nil {
+		_ = pc.RemoveTrack(req.TrackID)
+	}
+
 	// Send response
 	resp := TrackUnpublishedResponse{
 		TrackID:       req.TrackID,
@@ -554,6 +833,49 @@ func (h *Handler) handleSubscribeTrack(conn *Connection, room *domain.Room, part
 		return err
 	}
 
+	// SFU wiring: add subscriber PC to forwarder.
+	subPC := h.getPeerConnection(participant.ID())
+	if subPC == nil {
+		_ = participant.UnsubscribeTrack(req.TrackID)
+		return webrtc.ErrNoPeerConnection
+	}
+	fw := h.getForwarder(req.TrackID)
+	if fw == nil {
+		// Lazy forwarder creation from publisher's local track (publisher may have
+		// published via domain before SFU wiring existed, or forwarder was pruned
+		// after last unsubscribe).
+		if domTrack := room.GetTrack(req.TrackID); domTrack != nil {
+			if pub := domTrack.Publisher(); pub != nil {
+				if pubPC := h.getPeerConnection(pub.ID()); pubPC != nil {
+					if webTrack := pubPC.GetLocalTrack(req.TrackID); webTrack != nil {
+						var err error
+						fw, err = h.getOrCreateForwarder(req.TrackID, webTrack)
+						if err != nil {
+							_ = participant.UnsubscribeTrack(req.TrackID)
+							return err
+						}
+					}
+				}
+				// Fallback: publisher track has no WebRTCTrack yet; create a
+				// standalone publisher track so subscribers can still attach.
+				if fw == nil {
+					webTrack, err := h.createPublisherWebRTCTrack(domTrack)
+					if err == nil {
+						fw, _ = h.getOrCreateForwarder(req.TrackID, webTrack)
+					}
+				}
+			}
+		}
+	}
+	if fw == nil {
+		_ = participant.UnsubscribeTrack(req.TrackID)
+		return webrtc.ErrTrackNotReady
+	}
+	if err := fw.AddSubscriber(subPC); err != nil {
+		_ = participant.UnsubscribeTrack(req.TrackID)
+		return err
+	}
+
 	// Send response
 	resp := TrackSubscribedResponse{
 		TrackID:     req.TrackID,
@@ -562,6 +884,30 @@ func (h *Handler) handleSubscribeTrack(conn *Connection, room *domain.Room, part
 	}
 
 	return conn.Send(MessageTypeTrackSubscribed, resp)
+}
+
+// handleUnsubscribeTrack handles an unsubscribe track request.
+func (h *Handler) handleUnsubscribeTrack(conn *Connection, room *domain.Room, participant *domain.Participant, msg *Message) error {
+	var req UnsubscribeTrackRequest
+	if err := msg.UnmarshalData(&req); err != nil {
+		return err
+	}
+
+	if err := room.UnsubscribeFromTrack(participant, req.TrackID); err != nil {
+		return err
+	}
+
+	if pc := h.getPeerConnection(participant.ID()); pc != nil {
+		h.removeSubscriberFromForwarder(req.TrackID, pc)
+	}
+
+	resp := TrackUnsubscribedResponse{
+		TrackID:       req.TrackID,
+		ParticipantID: req.ParticipantID,
+		Status:        "success",
+	}
+
+	return conn.Send(MessageTypeTrackUnsubscribed, resp)
 }
 
 // handleOffer handles a WebRTC offer: the offer is applied to the target

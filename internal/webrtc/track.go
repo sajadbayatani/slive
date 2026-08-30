@@ -127,6 +127,16 @@ func (t *WebRTCTrack) Read(b []byte) (int, error) {
 	return n, err
 }
 
+// IsRemote reports whether the underlying Pion track is a TrackRemote
+// (i.e. a real publisher track arriving via PeerConnection.OnTrack). A
+// TrackLocalStaticRTP placeholder returns false.
+func (t *WebRTCTrack) IsRemote() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	_, ok := t.track.(*webrtc.TrackRemote)
+	return ok
+}
+
 // Close closes the underlying WebRTC track.
 func (t *WebRTCTrack) Close() error {
 	t.mu.Lock()

@@ -99,6 +99,7 @@ type PeerConnection struct {
 	onNegotiationNeeded func()
 	onICECandidate      func(*ICECandidate)
 	onTrack             func(*WebRTCTrack)
+	onLocalTrackAdded   func(*WebRTCTrack)
 	ctx                 context.Context
 	cancel              context.CancelFunc
 }
@@ -220,6 +221,7 @@ func (pc *PeerConnection) AddTrack(track *WebRTCTrack) error {
 
 	// Store the track and its sender
 	pc.localTracks[track.ID()] = track
+	callback := pc.onLocalTrackAdded
 
 	// Set up RTCP handling if needed
 	go func() {
@@ -234,6 +236,10 @@ func (pc *PeerConnection) AddTrack(track *WebRTCTrack) error {
 			}
 		}
 	}()
+
+	if callback != nil {
+		go callback(track)
+	}
 
 	return nil
 }
@@ -439,6 +445,15 @@ func (pc *PeerConnection) OnTrack(callback func(*WebRTCTrack)) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	pc.onTrack = callback
+}
+
+// OnLocalTrackAdded registers a callback invoked when a local track is added
+// via AddTrack. The callback receives the WebRTCTrack that was just added.
+// Passing nil clears a previously registered callback.
+func (pc *PeerConnection) OnLocalTrackAdded(callback func(*WebRTCTrack)) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	pc.onLocalTrackAdded = callback
 }
 
 // handleNegotiationNeeded is called when the peer connection needs to renegotiate.
