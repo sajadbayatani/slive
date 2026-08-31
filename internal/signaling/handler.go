@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	pionwebrtc "github.com/pion/webrtc/v3"
 	"github.com/sajadbayatani/slive/internal/domain"
@@ -12,6 +14,13 @@ import (
 )
 
 // Handler handles WebSocket signaling connections.
+//
+// Lock ordering (must be respected to avoid ABBA deadlocks):
+//
+//	gcMu > peerConnectionsMutex > trackForwardersMutex > Room.mu > Participant.mu
+//
+// reapGhost acquires gcMu first then peerConnectionsMutex/trackForwardersMutex
+// before calling Room.Leave (which acquires Room.mu), preserving this order.
 type Handler struct {
 	roomManager          *RoomManager
 	connectionManager    *ConnectionManager
@@ -28,6 +37,14 @@ type Handler struct {
 	// handed to every WebSocket connection and peer connection created by
 	// this handler.
 	logger *slog.Logger
+
+	// GC state for ghost participants whose transport dropped without explicit leave.
+	gcTTL         time.Duration
+	gcTicker      *time.Ticker
+	gcStop        chan struct{}
+	ghostTimers   map[string]*time.Timer
+	gcMu          sync.Mutex
+	gcReapedCount uint64
 }
 
 // HandlerOption customises a Handler at construction time.
@@ -53,6 +70,14 @@ func WithLogger(logger *slog.Logger) HandlerOption {
 	}
 }
 
+// WithGCTTL sets the ghost-participant GC TTL. A TTL of 0 disables GC.
+// Default is 60s. Exposed for config wiring and tests (TTL 100ms in tests).
+func WithGCTTL(d time.Duration) HandlerOption {
+	return func(h *Handler) {
+		h.gcTTL = d
+	}
+}
+
 // NewHandler creates a new Handler.
 func NewHandler(roomManager *RoomManager, opts ...HandlerOption) *Handler {
 	h := &Handler{
@@ -62,13 +87,23 @@ func NewHandler(roomManager *RoomManager, opts ...HandlerOption) *Handler {
 		trackForwarders:      make(map[string]*webrtc.TrackForwarder),
 		peerConnectionConfig: webrtc.DefaultPeerConnectionConfig(),
 		logger:               slog.Default(),
+		gcTTL:                60 * time.Second,
+		ghostTimers:          make(map[string]*time.Timer),
 	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(h)
 		}
 	}
+	if h.ghostTimers == nil {
+		h.ghostTimers = make(map[string]*time.Timer)
+	}
 	return h
+}
+
+// GCReapedCount returns the number of ghost participants reaped.
+func (h *Handler) GCReapedCount() uint64 {
+	return atomic.LoadUint64(&h.gcReapedCount)
 }
 
 // Shutdown gracefully shuts down all WebSocket connections and peer connections
@@ -77,6 +112,21 @@ func NewHandler(roomManager *RoomManager, opts ...HandlerOption) *Handler {
 // connections. After this method returns, the handler should not be used for new
 // connections.
 func (h *Handler) Shutdown() error {
+	// Stop GC timers/loop first so no reapGhost runs after shutdown.
+	h.gcMu.Lock()
+	if h.gcTicker != nil {
+		h.gcTicker.Stop()
+	}
+	if h.gcStop != nil {
+		close(h.gcStop)
+		h.gcStop = nil
+	}
+	for _, t := range h.ghostTimers {
+		t.Stop()
+	}
+	h.ghostTimers = make(map[string]*time.Timer)
+	h.gcMu.Unlock()
+
 	h.connectionManager.CloseAll()
 
 	// Stop all forwarders first: forwarder.Stop() removes the forwarded track
@@ -220,7 +270,9 @@ func (h *Handler) handleConnection(conn *Connection) {
 		// Notify other participants that a new participant has joined
 		h.broadcastParticipantJoined(room, participant)
 	} else {
-		// Reconnect existing participant
+		// Reconnect existing participant - cancel any pending ghost reap.
+		h.cancelGhostTimer(conn.ID())
+
 		participant.SetRoom(room)
 
 		// Reuse the existing peer connection or replace it when unusable;
@@ -614,6 +666,9 @@ func (h *Handler) handleLeaveRoom(conn *Connection, room *domain.Room, participa
 	if err := msg.UnmarshalData(&req); err != nil {
 		return err
 	}
+
+	// Cancel any pending ghost timer for this participant.
+	h.cancelGhostTimer(req.ParticipantID)
 
 	// Snapshot SFU state before room.Leave clears participant bookkeeping.
 	publishedTracks := participant.PublishedTracks()
@@ -1094,6 +1149,99 @@ func (h *Handler) handleConnectionClosed(room *domain.Room, participant *domain.
 		"participant_id", participant.ID(),
 		"room_id", room.ID(),
 		"peer_connection_state", pcState,
+	)
+
+	h.armGhostTimer(room.ID(), participant.ID())
+}
+
+// armGhostTimer starts or resets the ghost reap timer for participantID.
+func (h *Handler) armGhostTimer(roomID, participantID string) {
+	if h.gcTTL <= 0 {
+		return
+	}
+	h.gcMu.Lock()
+	defer h.gcMu.Unlock()
+	if t, exists := h.ghostTimers[participantID]; exists {
+		t.Stop()
+		delete(h.ghostTimers, participantID)
+	}
+	// Capture values for closure.
+	rid := roomID
+	pid := participantID
+	h.ghostTimers[participantID] = time.AfterFunc(h.gcTTL, func() {
+		h.reapGhost(rid, pid)
+	})
+}
+
+// cancelGhostTimer stops and removes the ghost timer for participantID.
+func (h *Handler) cancelGhostTimer(participantID string) {
+	h.gcMu.Lock()
+	defer h.gcMu.Unlock()
+	if t, exists := h.ghostTimers[participantID]; exists {
+		t.Stop()
+		delete(h.ghostTimers, participantID)
+	}
+}
+
+// reapGhost reaps a ghost participant whose transport dropped and never
+// reconnected within gcTTL. It is idempotent and respects lock ordering
+// gcMu > peerConnectionsMutex > trackForwardersMutex > Room.mu.
+func (h *Handler) reapGhost(roomID, participantID string) {
+	// Remove timer under gcMu.
+	h.gcMu.Lock()
+	if t, exists := h.ghostTimers[participantID]; exists {
+		// Timer already fired; just delete entry. Stop is optional.
+		if t != nil {
+			t.Stop()
+		}
+		delete(h.ghostTimers, participantID)
+	} else {
+		// If timer not found, continue idempotently; another reap or cancel may have run.
+	}
+	h.gcMu.Unlock()
+
+	room := h.roomManager.GetRoom(roomID)
+
+	var publishedTracks []string
+	var leaverPC *webrtc.PeerConnection
+
+	if room != nil {
+		if p := room.GetParticipant(participantID); p != nil {
+			publishedTracks = p.PublishedTracks()
+		}
+	}
+
+	leaverPC = h.getPeerConnection(participantID)
+
+	if room != nil {
+		if err := room.Leave(participantID); err != nil && err != domain.ErrParticipantNotFound {
+			h.logger.Warn("ghost reap: room.Leave failed",
+				"event", "ghost_reap_leave_failed",
+				"participant_id", participantID,
+				"room_id", roomID,
+				"error", err,
+			)
+		}
+		// If room nil, participant not in room: still clean forwarders/PC below.
+		_ = room // avoid unused if needed
+	}
+
+	for _, trackID := range publishedTracks {
+		h.removeForwarder(trackID)
+	}
+	if leaverPC != nil {
+		h.removeSubscriberFromAllForwarders(leaverPC)
+	}
+	h.closePeerConnection(participantID)
+
+	atomic.AddUint64(&h.gcReapedCount, 1)
+
+	h.logger.Info("ghost participant reaped",
+		"event", "ghost_reaped",
+		"participant_id", participantID,
+		"room_id", roomID,
+		"published_tracks", len(publishedTracks),
+		"ttl", h.gcTTL.String(),
 	)
 }
 

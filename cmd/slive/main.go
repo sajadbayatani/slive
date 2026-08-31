@@ -67,6 +67,7 @@ func newSignalingHandler(cfg config.Config, log *logger.Logger) *signaling.Handl
 		signaling.NewRoomManager(),
 		signaling.WithPeerConnectionConfig(buildPeerConnectionConfig(cfg)),
 		signaling.WithLogger(log.Logger),
+		signaling.WithGCTTL(cfg.GCParticipantTTL),
 	)
 }
 

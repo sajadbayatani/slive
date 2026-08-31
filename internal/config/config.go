@@ -4,14 +4,16 @@ package config
 import (
 	"os"
 	"strings"
+	"time"
 )
 
 type Config struct {
-	HTTPAddr      string
-	HealthPath    string
-	WebSocketPath string
-	STUNServers   []string
-	TURNServers   []TURNServer
+	HTTPAddr         string
+	HealthPath       string
+	WebSocketPath    string
+	STUNServers      []string
+	TURNServers      []TURNServer
+	GCParticipantTTL time.Duration
 }
 
 // TURNServer describes one TURN endpoint and its optional credentials.
@@ -23,9 +25,10 @@ type TURNServer struct {
 }
 
 const (
-	DefaultHTTPAddr      = ":8080"
-	DefaultHealthPath    = "/health"
-	DefaultWebSocketPath = "/ws"
+	DefaultHTTPAddr         = ":8080"
+	DefaultHealthPath       = "/health"
+	DefaultWebSocketPath    = "/ws"
+	DefaultGCParticipantTTL = 60 * time.Second
 )
 
 // Load reads runtime configuration. Comma-separated STUN_SERVERS and
@@ -33,10 +36,11 @@ const (
 // to each configured TURN server.
 func Load() Config {
 	cfg := Config{
-		HTTPAddr:      envOrDefault("HTTP_ADDR", DefaultHTTPAddr),
-		HealthPath:    envOrDefault("HEALTH_PATH", DefaultHealthPath),
-		WebSocketPath: envOrDefault("WEBSOCKET_PATH", DefaultWebSocketPath),
-		STUNServers:   splitServerURLs(os.Getenv("STUN_SERVERS")),
+		HTTPAddr:         envOrDefault("HTTP_ADDR", DefaultHTTPAddr),
+		HealthPath:       envOrDefault("HEALTH_PATH", DefaultHealthPath),
+		WebSocketPath:    envOrDefault("WEBSOCKET_PATH", DefaultWebSocketPath),
+		STUNServers:      splitServerURLs(os.Getenv("STUN_SERVERS")),
+		GCParticipantTTL: parseDurationOrDefault(os.Getenv("SLIVE_GC_TTL"), DefaultGCParticipantTTL),
 	}
 
 	if turnURLs := splitServerURLs(os.Getenv("TURN_SERVERS")); len(turnURLs) > 0 {
@@ -67,4 +71,14 @@ func splitServerURLs(value string) []string {
 	}
 
 	return urls
+}
+
+func parseDurationOrDefault(value string, fallback time.Duration) time.Duration {
+	if value == "" {
+		return fallback
+	}
+	if d, err := time.ParseDuration(value); err == nil {
+		return d
+	}
+	return fallback
 }
