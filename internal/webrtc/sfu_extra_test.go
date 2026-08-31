@@ -148,10 +148,13 @@ func TestTrackForwarder_PublisherClose(t *testing.T) {
 	if err := fw.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	// For local tracks, run exits immediately (ErrTrackNotReady), but Start still marks running.
+	// TrackLocal: Start is no-op, IsRunning stays false (B3 fix).
+	if fw.IsRunning() {
+		t.Error("IsRunning should be false after Start on TrackLocal")
+	}
 	// Publisher close should not deadlock Stop.
 	_ = pub.Close()
-	// Give run goroutine a chance to exit
+	// Give run goroutine a chance to exit (no-op for TrackLocal)
 	time.Sleep(100 * time.Millisecond)
 	// Stop must clean up tracks and be idempotent
 	if err := fw.Stop(); err != nil {

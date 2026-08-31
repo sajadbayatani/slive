@@ -81,12 +81,16 @@ func TestTrackForwarderLifecycle(t *testing.T) {
 	if err := fw.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if !fw.IsRunning() {
-		t.Error("should be running after Start")
+	// TrackLocal placeholder: Start is no-op, IsRunning stays false (B3 fix)
+	if fw.IsRunning() {
+		t.Error("IsRunning should be false after Start on TrackLocal")
 	}
 	// Idempotent second Start
 	if err := fw.Start(); err != nil {
 		t.Fatalf("second Start: %v", err)
+	}
+	if fw.IsRunning() {
+		t.Error("IsRunning should remain false after second Start on TrackLocal")
 	}
 
 	if err := fw.Stop(); err != nil {

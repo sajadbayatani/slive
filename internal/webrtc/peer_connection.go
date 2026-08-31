@@ -1,3 +1,13 @@
+// Package webrtc implements SFU forwarding and peer connection management.
+//
+// Lock hierarchy (must be respected to avoid deadlocks):
+//
+//	PeerConnection.mu > TrackForwarder.mu > WebRTCTrack.mu
+//	Handler.trackForwardersMutex > TrackForwarder.lifecycleMu > TrackForwarder.mu
+//
+// TrackForwarder must never call Handler while holding mu, and callbacks
+// registered via OnLocalTrackAdded / OnTrack must never acquire
+// TrackForwarder.mu while holding PeerConnection.mu.
 package webrtc
 
 import (
@@ -194,16 +204,23 @@ func (pc *PeerConnection) Config() PeerConnectionConfig {
 }
 
 // AddTrack adds a local track to the peer connection.
+//
+// Lock hierarchy: PeerConnection.mu is held only to update localTracks and
+// snapshot the OnLocalTrackAdded callback; the callback is invoked outside
+// mu via a goroutine with panic recovery so user code never runs on pion's
+// dispatch path and does not invert PeerConnection.mu > TrackForwarder.mu.
+// Callbacks must not acquire TrackForwarder.mu while holding pc.mu.
 func (pc *PeerConnection) AddTrack(track *WebRTCTrack) error {
 	pc.mu.Lock()
-	defer pc.mu.Unlock()
 
 	if pc.state == PeerConnectionStateClosed || pc.state == PeerConnectionStateFailed {
+		pc.mu.Unlock()
 		return ErrPeerConnectionClosed
 	}
 
 	pionTrack := track.PionTrack()
 	if pionTrack == nil {
+		pc.mu.Unlock()
 		return ErrTrackNotReady
 	}
 
@@ -211,23 +228,28 @@ func (pc *PeerConnection) AddTrack(track *WebRTCTrack) error {
 	// We need to check if the track is a TrackLocal
 	trackLocal, ok := pionTrack.(webrtc.TrackLocal)
 	if !ok {
+		pc.mu.Unlock()
 		return ErrTrackNotReady
 	}
 
 	sender, err := pc.pionPC.AddTrack(trackLocal)
 	if err != nil {
+		pc.mu.Unlock()
 		return err
 	}
 
 	// Store the track and its sender
 	pc.localTracks[track.ID()] = track
 	callback := pc.onLocalTrackAdded
+	ctx := pc.ctx
+	logger := pc.logger
+	pc.mu.Unlock()
 
-	// Set up RTCP handling if needed
+	// Set up RTCP handling if needed (outside lock)
 	go func() {
 		for {
 			select {
-			case <-pc.ctx.Done():
+			case <-ctx.Done():
 				return
 			default:
 				if _, _, err := sender.ReadRTCP(); err != nil {
@@ -238,7 +260,17 @@ func (pc *PeerConnection) AddTrack(track *WebRTCTrack) error {
 	}()
 
 	if callback != nil {
-		go callback(track)
+		go func(cb func(*WebRTCTrack), t *WebRTCTrack) {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Warn("OnLocalTrackAdded callback panicked",
+						"event", "on_local_track_added_panic",
+						"error", r,
+					)
+				}
+			}()
+			cb(t)
+		}(callback, track)
 	}
 
 	return nil
@@ -449,7 +481,9 @@ func (pc *PeerConnection) OnTrack(callback func(*WebRTCTrack)) {
 
 // OnLocalTrackAdded registers a callback invoked when a local track is added
 // via AddTrack. The callback receives the WebRTCTrack that was just added.
-// Passing nil clears a previously registered callback.
+// Passing nil clears a previously registered callback. Callbacks are invoked
+// outside PeerConnection.mu via a goroutine with panic recovery; they must
+// not acquire TrackForwarder.mu while holding pc.mu (see lock hierarchy).
 func (pc *PeerConnection) OnLocalTrackAdded(callback func(*WebRTCTrack)) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
@@ -460,14 +494,26 @@ func (pc *PeerConnection) OnLocalTrackAdded(callback func(*WebRTCTrack)) {
 // It invokes a registered callback (asynchronously, so user code never runs on
 // pion's dispatch goroutine) and, when a signaling sender is configured,
 // automatically creates an offer and pushes it over the signaling channel.
+// Callback panics are recovered and logged.
 func (pc *PeerConnection) handleNegotiationNeeded() {
 	pc.mu.RLock()
 	callback := pc.onNegotiationNeeded
 	sendSignaling := pc.sendSignaling
+	logger := pc.logger
 	pc.mu.RUnlock()
 
 	if callback != nil {
-		go callback()
+		go func(cb func()) {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Warn("OnNegotiationNeeded callback panicked",
+						"event", "on_negotiation_needed_panic",
+						"error", r,
+					)
+				}
+			}()
+			cb()
+		}(callback)
 	}
 
 	if sendSignaling == nil {
