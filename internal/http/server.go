@@ -6,6 +6,7 @@ import (
 
 	"github.com/sajadbayatani/slive/internal/config"
 	"github.com/sajadbayatani/slive/internal/logger"
+	webrtc "github.com/sajadbayatani/slive/internal/webrtc"
 )
 
 // Server wraps an HTTP server with configuration and dependencies.
@@ -20,7 +21,9 @@ type Server struct {
 type Option func(*options)
 
 type options struct {
-	signalingHandler http.Handler
+	signalingHandler      http.Handler
+	diagnosticsSnapshoter DiagnosticsSnapshoter
+	metricsSnapshot       func() webrtc.MetricsSnapshot
 }
 
 // WithSignalingHandler mounts an additional http.Handler — the WebSocket
@@ -31,6 +34,30 @@ func WithSignalingHandler(handler http.Handler) Option {
 	return func(o *options) {
 		if handler != nil {
 			o.signalingHandler = handler
+		}
+	}
+}
+
+// WithDiagnosticsSnapshoter wires a diagnostics snapshot source for GET
+// /healthz. The snapshot is called once per scrape outside any handler lock
+// and encoded without holding Handler.trackForwardersMutex or Room.mu, so
+// scrapers never block TrackForwarder.WriteRTP. See [DiagnosticsSnapshoter]
+// and [webrtc.MetricsSnapshot] for the response shape.
+func WithDiagnosticsSnapshoter(s DiagnosticsSnapshoter) Option {
+	return func(o *options) {
+		if s != nil {
+			o.diagnosticsSnapshoter = s
+		}
+	}
+}
+
+// WithMetricsSnapshot wires a function snapshot source for GET /healthz.
+// It is the functional alternative to [WithDiagnosticsSnapshoter]; if both
+// are provided, the function takes precedence.
+func WithMetricsSnapshot(fn func() webrtc.MetricsSnapshot) Option {
+	return func(o *options) {
+		if fn != nil {
+			o.metricsSnapshot = fn
 		}
 	}
 }
@@ -51,8 +78,10 @@ func NewServer(
 
 	// Create handler dependencies
 	deps := HandlerDeps{
-		Log:              log,
-		SignalingHandler: applied.signalingHandler,
+		Log:                   log,
+		SignalingHandler:      applied.signalingHandler,
+		MetricsSnapshot:       applied.metricsSnapshot,
+		DiagnosticsSnapshoter: applied.diagnosticsSnapshoter,
 	}
 
 	// Create and configure the router

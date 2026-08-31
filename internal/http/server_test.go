@@ -51,13 +51,15 @@ func TestHealthHandler(t *testing.T) {
 		t.Fatalf("Failed to read response body: %v", err)
 	}
 
-	var response map[string]string
+	var response struct {
+		Status string `json:"status"`
+	}
 	if err := json.Unmarshal(body, &response); err != nil {
 		t.Fatalf("Failed to unmarshal response body: %v", err)
 	}
 
-	if response["status"] != "ok" {
-		t.Errorf("Expected status 'ok', got '%s'", response["status"])
+	if response.Status != "ok" {
+		t.Errorf("Expected status 'ok', got '%s'", response.Status)
 	}
 }
 
@@ -103,13 +105,15 @@ func TestServer_Start_Shutdown(t *testing.T) {
 		t.Fatalf("Failed to read response body: %v", err)
 	}
 
-	var response map[string]string
+	var response struct {
+		Status string `json:"status"`
+	}
 	if err := json.Unmarshal(body, &response); err != nil {
 		t.Fatalf("Failed to unmarshal response body: %v", err)
 	}
 
-	if response["status"] != "ok" {
-		t.Errorf("Expected status 'ok', got '%s'", response["status"])
+	if response.Status != "ok" {
+		t.Errorf("Expected status 'ok', got '%s'", response.Status)
 	}
 }
 
@@ -253,13 +257,15 @@ func TestRouter_Integration(t *testing.T) {
 		t.Fatalf("Failed to read response body: %v", err)
 	}
 
-	var response map[string]string
+	var response struct {
+		Status string `json:"status"`
+	}
 	if err := json.Unmarshal(body, &response); err != nil {
 		t.Fatalf("Failed to unmarshal response body: %v", err)
 	}
 
-	if response["status"] != "ok" {
-		t.Errorf("Expected status 'ok', got '%s'", response["status"])
+	if response.Status != "ok" {
+		t.Errorf("Expected status 'ok', got '%s'", response.Status)
 	}
 }
 

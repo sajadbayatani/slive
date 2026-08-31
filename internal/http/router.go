@@ -33,13 +33,26 @@ func NewRouter(cfg config.Config, deps HandlerDeps) *Router {
 // This method is called during router initialization.
 func (r *Router) registerRoutes(cfg config.Config) {
 	// The health path comes from runtime configuration rather than being
-	// hardcoded in the HTTP layer.
+	// hardcoded in the HTTP layer. Both /health (legacy, TASK-014) and
+	// /healthz (diagnostics, TASK-026) are always registered alongside any
+	// custom HealthPath so operators can rely on /healthz for scraping while
+	// existing probes on /health keep working. The snapshot is acquired
+	// outside any handler lock and encoded without holding
+	// Handler.trackForwardersMutex or Room.mu.
 	healthHandler := NewHealthHandler(r.deps)
 	healthPath := cfg.HealthPath
 	if healthPath == "" {
 		healthPath = config.DefaultHealthPath
 	}
-	r.mux.Handle(healthPath, healthHandler)
+	// Deduplicate registrations to avoid ServeMux panic on duplicate patterns.
+	healthPaths := map[string]struct{}{
+		healthPath: {},
+		"/health":  {},
+		"/healthz": {},
+	}
+	for p := range healthPaths {
+		r.mux.Handle(p, healthHandler)
+	}
 
 	// The WebSocket signaling endpoint is injected via HandlerDeps (see
 	// cmd/slive for the production wiring). The path comes from runtime
