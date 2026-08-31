@@ -28,6 +28,16 @@ type extMirror struct {
 	payload []byte
 }
 
+// packetPool recycles *rtp.Packet structs for WriteRTP cloning.
+// Pooling the Packet struct (not the Payload slice) reduces alloc from
+// 79% of harness allocations (see TASK-029 pprof) while keeping deep
+// Payload/Extension.Payload copies correct. Payload slices remain per-packet
+// alloc and are GC'd; the Packet struct is returned to the pool by runWriter
+// after WriteRTP and by WriteRTP on queue-full drop. Lock hierarchy unchanged.
+var packetPool = sync.Pool{
+	New: func() any { return &rtp.Packet{} },
+}
+
 // Lock hierarchy (must be respected to avoid deadlocks):
 //
 //	PeerConnection.mu > TrackForwarder.mu > WebRTCTrack.mu
@@ -65,19 +75,29 @@ func (e *subscriberEntry) runWriter() {
 				select {
 				case pkt := <-e.queue:
 					_ = e.pionTrack.WriteRTP(pkt)
+					// Recycle Packet struct; payload slice is GC'd.
+					*pkt = rtp.Packet{}
+					packetPool.Put(pkt)
 				default:
 					return
 				}
 			}
 		case pkt := <-e.queue:
 			_ = e.pionTrack.WriteRTP(pkt)
+			*pkt = rtp.Packet{}
+			packetPool.Put(pkt)
 		}
 	}
 }
 
 // clonePacket deep-copies Payload and each Extension.Payload.
+// It reuses a *rtp.Packet from packetPool to reduce alloc; caller owns the
+// returned packet and must Put it back to packetPool after use (runWriter and
+// WriteRTP drop path do this). Deep copy of Payload and Extension.Payload
+// is preserved for correctness.
 func clonePacket(pkt *rtp.Packet) *rtp.Packet {
-	clone := *pkt
+	clone := packetPool.Get().(*rtp.Packet)
+	*clone = *pkt
 	if pkt.Payload != nil {
 		payloadCopy := make([]byte, len(pkt.Payload))
 		copy(payloadCopy, pkt.Payload)
@@ -95,7 +115,7 @@ func clonePacket(pkt *rtp.Packet) *rtp.Packet {
 		}
 		clone.Header.Extensions = exts
 	}
-	return &clone
+	return clone
 }
 
 // TrackForwarder fans RTP packets from a publisher's WebRTCTrack out to
@@ -536,6 +556,10 @@ func (f *TrackForwarder) Stop() error {
 // per-binding SSRC/payload-type rewrite does not race. Slow subscribers
 // never block fast ones: enqueue is non-blocking; on full queue the packet
 // is dropped and DroppedCount increments.
+//
+// Hardened: single RLock snapshot for entries+trackID (was double RLock),
+// and queue-full check before clone to avoid alloc on dropped packets.
+// Clone uses packetPool; dropped clones are returned to pool.
 func (f *TrackForwarder) WriteRTP(pkt *rtp.Packet) error {
 	if pkt == nil {
 		return errors.New("nil RTP packet")
@@ -550,19 +574,14 @@ func (f *TrackForwarder) WriteRTP(pkt *rtp.Packet) error {
 	for _, e := range f.subscribers {
 		entries = append(entries, e)
 	}
-	f.mu.RUnlock()
-
 	trackID := ""
-	f.mu.RLock()
 	if f.publisher != nil {
 		trackID = f.publisher.ID()
 	}
 	f.mu.RUnlock()
 	for _, e := range entries {
-		clone := clonePacket(pkt)
-		select {
-		case e.queue <- clone:
-		default:
+		// Fast-path: queue full, avoid clone alloc.
+		if len(e.queue) == cap(e.queue) {
 			dropped := atomic.AddUint64(&e.droppedCount, 1)
 			queueDepth := len(e.queue)
 			subscriberID := ""
@@ -571,6 +590,36 @@ func (f *TrackForwarder) WriteRTP(pkt *rtp.Packet) error {
 					subscriberID = p.ID()
 				}
 			}
+			now := time.Now().UnixNano()
+			last := f.lastDropLog.Load()
+			if now-last >= int64(time.Second) {
+				if f.lastDropLog.CompareAndSwap(last, now) {
+					slog.Default().Warn("queue dropped",
+						"event", "queue_dropped",
+						"track_id", trackID,
+						"subscriber_id", subscriberID,
+						"dropped_total", dropped,
+						"queue_depth", queueDepth,
+					)
+				}
+			}
+			continue
+		}
+		clone := clonePacket(pkt)
+		select {
+		case e.queue <- clone:
+		default:
+			// Queue became full between len check and send (race): return clone to pool.
+			dropped := atomic.AddUint64(&e.droppedCount, 1)
+			queueDepth := len(e.queue)
+			subscriberID := ""
+			if e.pc != nil {
+				if p := e.pc.Participant(); p != nil {
+					subscriberID = p.ID()
+				}
+			}
+			*clone = rtp.Packet{}
+			packetPool.Put(clone)
 			now := time.Now().UnixNano()
 			last := f.lastDropLog.Load()
 			if now-last >= int64(time.Second) {
