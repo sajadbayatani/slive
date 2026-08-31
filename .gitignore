@@ -28,6 +28,7 @@ skills/
 roadmap/
 reports/
 docs/AGENT*
+.qoder
 
 # OS
 .DS_Store

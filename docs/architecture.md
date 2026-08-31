@@ -9,71 +9,71 @@ This document describes the architecture of Slive, a self-hosted real-time commu
 ## High-Level Architecture
 
 ```text
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              Slive Server                                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
+┌───────────────────────────────────────────────────────────────────────────┐
+│                              Slive Server                                 │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │                         HTTP Layer                                    │  │
-│  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
-│  │  │                      http.Server                                  │  │  │
-│  │  │  - Listens on configurable address (default: :8080)             │  │  │
-│  │  │  - Manages HTTP server lifecycle (Start/Shutdown)                │  │  │
-│  │  └─────────────────────────────────────────────────────────────────┘  │  │
+│  │                         HTTP Layer                                  │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐│  │
+│  │  │                      http.Server                                ││  │
+│  │  │  - Listens on configurable address (default: :8080)             ││  │
+│  │  │  - Manages HTTP server lifecycle (Start/Shutdown)               ││  │
+│  │  └─────────────────────────────────────────────────────────────────┘│  │
 │  │                                                                     │  │
-│  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
-│  │  │                       http.Router                                  │  │  │
-│  │  │  - /health → HealthHandler (liveness check)                      │  │  │
-│  │  │  - /ws?room_id=&participant_id= → signaling.Handler              │  │  │
-│  │  │    (WebSocket upgrade; WEBSOCKET_PATH configurable)              │  │  │
-│  │  └─────────────────────────────────────────────────────────────────┘  │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐│  │
+│  │  │                       http.Router                               ││  │
+│  │  │  - /health → HealthHandler (liveness check)                     ││  │
+│  │  │  - /ws?room_id=&participant_id= → signaling.Handler             ││  │
+│  │  │    (WebSocket upgrade; WEBSOCKET_PATH configurable)             ││  │
+│  │  └─────────────────────────────────────────────────────────────────┘│  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                             │
+│                                                                           │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │                      Signaling Layer                                  │  │
-│  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
-│  │  │                    signaling.Handler                               │  │  │
-│  │  │  - Handles WebSocket connections                                   │  │  │
-│  │  │  - Routes messages to appropriate handlers                        │  │  │
-│  │  │  - Manages connection lifecycle                                    │  │  │
-│  │  │  - Coordinates between RoomManager and ConnectionManager         │  │  │
-│  │  └─────────────────────────────────────────────────────────────────┘  │  │
+│  │                      Signaling Layer                                │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐│  │
+│  │  │                    signaling.Handler                            ││  │
+│  │  │  - Handles WebSocket connections                                ││  │
+│  │  │  - Routes messages to appropriate handlers                      ││  │
+│  │  │  - Manages connection lifecycle                                 ││  │
+│  │  │  - Coordinates between RoomManager and ConnectionManager        ││  │
+│  │  └─────────────────────────────────────────────────────────────────┘│  │
 │  │                                                                     │  │
-│  │  ┌─────────────────────┐  ┌─────────────────────┐  ┌───────────────┐  │  │
-│  │  │   RoomManager         │  │  ConnectionManager   │  │    Handler     │  │  │
-│  │  │                     │  │                      │  │    Helpers     │  │  │
-│  │  │ - Create/Get/Close    │  │ - Add/Remove/Get     │  │ - Broadcast    │  │  │
-│  │  │   rooms              │  │   connections        │  │ - Notification │  │  │
-│  │  │ - Thread-safe        │  │ - Thread-safe        │  │   helpers      │  │  │
-│  │  └─────────────────────┘  └─────────────────────┘  └───────────────┘  │  │
+│  │  ┌─────────────────────┐  ┌─────────────────────┐  ┌───────────────┐│  │
+│  │  │   RoomManager       │  │  ConnectionManager  │  │    Handler    ││  │
+│  │  │                     │  │                     │  │    Helpers    ││  │
+│  │  │ - Create/Get/Close  │  │ - Add/Remove/Get    │  │ - Broadcast   ││  │
+│  │  │   rooms             │  │   connections       │  │ - Notification││  │
+│  │  │ - Thread-safe       │  │ - Thread-safe       │  │   helpers     ││  │
+│  │  └─────────────────────┘  └─────────────────────┘  └───────────────┘│  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                             │
+│                                                                           │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │                       Domain Layer                                    │  │
-│  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐      │  │
-│  │  │    domain.Room   │  │ domain.Participant│  │   domain.Track   │      │  │
-│  │  │                 │  │                  │  │                 │      │  │
-│  │  │ - ID            │  │ - ID             │  │ - ID             │      │  │
-│  │  │ - State         │  │ - Name           │  │ - Kind           │      │  │
-│  │  │ - Participants  │  │ - State          │  │ - Source         │      │  │
-│  │  │ - Thread-safe   │  │ - Room           │  │ - State          │      │  │
-│  │  │                 │  │ - pubTracks      │  │ - Publisher      │      │  │
-│  │  │                 │  │ - subTracks      │  │ - Thread-safe    │      │  │
-│  │  └─────────────────┘  └─────────────────┘  └─────────────────┘      │  │
+│  │                       Domain Layer                                  │  │
+│  │  ┌─────────────────┐  ┌──────────────────┐  ┌──────────────────┐    │  │
+│  │  │    domain.Room  │  │domain.Participant│  │   domain.Track   │    │  │
+│  │  │                 │  │                  │  │                  │    │  │
+│  │  │ - ID            │  │ - ID             │  │ - ID             │    │  │
+│  │  │ - State         │  │ - Name           │  │ - Kind           │    │  │
+│  │  │ - Participants  │  │ - State          │  │ - Source         │    │  │
+│  │  │ - Thread-safe   │  │ - Room           │  │ - State          │    │  │
+│  │  │                 │  │ - pubTracks      │  │ - Publisher      │    │  │
+│  │  │                 │  │ - subTracks      │  │ - Thread-safe    │    │  │
+│  │  └─────────────────┘  └──────────────────┘  └──────────────────┘    │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                             │
+│                                                                           │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │                      Support Layers                                   │  │
-│  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐      │  │
-│  │  │  config.Config   │  │  logger.Logger   │  │   (future)       │      │  │
-│  │  │                 │  │                  │  │   SFU            │      │  │
-│  │  │ - HTTPAddr      │  │ - Structured     │  │   MediaServer    │      │  │
-│  │  │ - Environment   │  │   logging        │  │   (planned)      │      │  │
-│  │  │   variables     │  │ - Levels         │  │                 │      │  │
-│  │  └─────────────────┘  └─────────────────┘  └─────────────────┘      │  │
+│  │                      Support Layers                                 │  │
+│  │  ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────┐     │  │
+│  │  │  config.Config  │  │  logger.Logger   │  │   (future)      │     │  │
+│  │  │                 │  │                  │  │   SFU           │     │  │
+│  │  │ - HTTPAddr      │  │ - Structured     │  │   MediaServer   │     │  │
+│  │  │ - Environment   │  │   logging        │  │   (planned)     │     │  │
+│  │  │   variables     │  │ - Levels         │  │                 │     │  │
+│  │  └─────────────────┘  └──────────────────┘  └─────────────────┘     │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────┘
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -252,12 +252,12 @@ created → published → unpublished
                           │                        │
                           │ WebSocket Upgrade      │
                           ▼                        ▼
-                    ┌─────────────┐       ┌─────────────┐
-                    │  Connection  │       │ RoomManager  │
+                    ┌─────────────┐       ┌──────────────┐
+                    │  Connection │       │ RoomManager  │
                     │             │       │              │
                     │ - Send/Recv │       │ - Get/Create │
-                    │ - Channels  │◄──────►│ - Rooms      │
-                    └─────────────┘       └─────────────┘
+                    │ - Channels  │◄─────►│ - Rooms      │
+                    └─────────────┘       └──────────────┘
                           │                        │
                           │ Messages               │
                           ▼                        ▼
@@ -525,39 +525,39 @@ Room.Close()
 ### Single Server Deployment
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│                         Server Machine                            │
+┌───────────────────────────────────────────────────────────────┐
+│                         Server Machine                        │
 │  ┌─────────────────────────────────────────────────────────┐  │
-│  │                      Slive Server                            │  │
+│  │                      Slive Server                       │  │
 │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐      │  │
-│  │  │  HTTP        │  │  Signaling    │  │   Domain     │      │  │
-│  │  │  Server      │  │  Layer       │  │   Layer      │      │  │
+│  │  │  HTTP       │  │  Signaling  │  │   Domain    │      │  │
+│  │  │  Server     │  │  Layer      │  │   Layer     │      │  │
 │  │  └─────────────┘  └─────────────┘  └─────────────┘      │  │
 │  └─────────────────────────────────────────────────────────┘  │
-│                              │                                   │
-│                              ▼                                   │
+│                              │                                │
+│                              ▼                                │
 │  ┌─────────────────────────────────────────────────────────┐  │
-│  │                      Clients                                 │  │
+│  │                      Clients                            │  │
 │  │  ┌─────────┐  ┌─────────┐  ┌─────────┐                  │  │
 │  │  │ Client  │  │ Client  │  │ Client  │                  │  │
 │  │  │   1     │  │   2     │  │   3     │                  │  │
 │  │  └─────────┘  └─────────┘  └─────────┘                  │  │
 │  └─────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ### Docker Deployment
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│                      Docker Container                            │
+┌───────────────────────────────────────────────────────────────┐
+│                      Docker Container                         │
 │  ┌─────────────────────────────────────────────────────────┐  │
-│  │                      Slive Server                            │  │
-│  │  - Built from Dockerfile                                   │  │
-│  │  - Exposes port 8080 (configurable)                       │  │
-│  │  - Environment variables for configuration                 │  │
+│  │                      Slive Server                       │  │
+│  │  - Built from Dockerfile                                │  │
+│  │  - Exposes port 8080 (configurable)                     │  │
+│  │  - Environment variables for configuration              │  │
 │  └─────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -567,25 +567,25 @@ Room.Close()
 ### Planned Components
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│                      Future Architecture                         │
+┌───────────────────────────────────────────────────────────────┐
+│                      Future Architecture                      │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐            │
-│  │  Signaling   │  │    SFU       │  │   Media      │            │
-│  │  Server     │  │  Server      │  │  Storage     │            │
+│  │  Signaling  │  │    SFU      │  │   Media     │            │
+│  │  Server     │  │  Server     │  │  Storage    │            │
 │  └─────────────┘  └─────────────┘  └─────────────┘            │
 │       │               │                  │                    │
 │       ▼               ▼                  ▼                    │
 │  ┌─────────────────────────────────────────────────────────┐  │
-│  │                      Redis Cluster                           │  │
-│  │  - Shared state for distributed deployment                 │  │
-│  │  - Room and participant metadata                           │  │
+│  │                      Redis Cluster                      │  │
+│  │  - Shared state for distributed deployment              │  │
+│  │  - Room and participant metadata                        │  │
 │  └─────────────────────────────────────────────────────────┘  │
-│                                                                 │
+│                                                               │
 │  ┌─────────────────────────────────────────────────────────┐  │
-│  │                      Load Balancer                           │  │
-│  │  - Distributes connections across signaling servers        │  │
+│  │                      Load Balancer                      │  │
+│  │  - Distributes connections across signaling servers     │  │
 │  └─────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ### SFU Integration (Future)
@@ -593,23 +593,23 @@ Room.Close()
 The Selective Forwarding Unit will be added to handle media routing:
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│                      Media Flow with SFU                         │
-│                                                                 │
-│  Publisher → Signaling → SFU → Subscriber                        │
-│       │            │          │           │                        │
-│       │ publish    │          │ forward   │                        │
-│       ▼            ▼          ▼           ▼                        │
-│  Media Track ─────────────────────────────────────────────► Subscriber
-│       │                                            │                │
-│       │                                            ▼                │
-│       │                                      SFU selects            │
-│       │                                       best streams          │
-│       │                                            │                │
-│       ▼                                            ▼                │
-│  RTP Packets ─────────────────────────────────────────────► RTP Packets
-│                                                                 │
-└─────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│                      Media Flow with SFU                      │
+│                                                               │
+│  Publisher → Signaling → SFU → Subscriber                     │
+│       │            │          │           │                   │
+│       │ publish    │          │ forward   │                   │
+│       ▼            ▼          ▼           ▼                   │
+│  Media Track ───────────────────────────────────────────► Subscriber
+│       │                                            │          │
+│       │                                            ▼          │
+│       │                                      SFU selects      │
+│       │                                       best streams    │
+│       │                                            │          │
+│       ▼                                            ▼          │
+│  RTP Packets ───────────────────────────────────────────► RTP Packets
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ---
