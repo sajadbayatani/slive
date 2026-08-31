@@ -286,6 +286,22 @@ func (h *Handler) handleConnection(conn *Connection) {
 		}
 	}
 
+	// Structured event: peer_connected (outside mu, after ensurePeerConnection)
+	{
+		roomID := room.ID()
+		participantID := participant.ID()
+		state := ""
+		if pc := h.getPeerConnection(participantID); pc != nil {
+			state = pc.State().String()
+		}
+		h.logger.Info("peer connected",
+			"event", "peer_connected",
+			"room_id", roomID,
+			"participant_id", participantID,
+			"state", state,
+		)
+	}
+
 	// Send room joined response
 	if err := h.sendRoomJoined(conn, room, participant); err != nil {
 		h.logger.Error("failed to send room joined response",
@@ -825,6 +841,19 @@ func (h *Handler) handlePublishTrack(conn *Connection, room *domain.Room, partic
 		return err
 	}
 
+	// Structured event outside mu: track_available
+	roomID := room.ID()
+	participantID := participant.ID()
+	trackID := track.ID()
+	kindStr := track.Kind().String()
+	h.logger.Info("track available",
+		"event", "track_available",
+		"room_id", roomID,
+		"participant_id", participantID,
+		"track_id", trackID,
+		"kind", kindStr,
+	)
+
 	// Notify other participants
 	h.broadcastTrackAvailable(room, participant, track)
 
@@ -866,6 +895,18 @@ func (h *Handler) handleUnpublishTrack(conn *Connection, room *domain.Room, part
 	if err := conn.Send(MessageTypeTrackUnpublished, resp); err != nil {
 		return err
 	}
+
+	roomID := room.ID()
+	participantID := participant.ID()
+	trackID := req.TrackID
+	// Kind unknown after unpublish; log without kind but keep required keys.
+	h.logger.Info("track unavailable",
+		"event", "track_unavailable",
+		"room_id", roomID,
+		"participant_id", participantID,
+		"track_id", trackID,
+		"kind", "",
+	)
 
 	// Notify other participants
 	h.broadcastTrackUnavailable(room, participant, req.TrackID)
@@ -1144,14 +1185,18 @@ func (h *Handler) handleConnectionClosed(room *domain.Room, participant *domain.
 		pcState = pc.State().String()
 	}
 
+	roomID := room.ID()
+	participantID := participant.ID()
+	ttl := h.gcTTL.String()
 	h.logger.Info("peer transport dropped; session kept alive for reconnect",
 		"event", "peer_disconnected",
-		"participant_id", participant.ID(),
-		"room_id", room.ID(),
-		"peer_connection_state", pcState,
+		"room_id", roomID,
+		"participant_id", participantID,
+		"state", pcState,
+		"ttl", ttl,
 	)
 
-	h.armGhostTimer(room.ID(), participant.ID())
+	h.armGhostTimer(roomID, participantID)
 }
 
 // armGhostTimer starts or resets the ghost reap timer for participantID.

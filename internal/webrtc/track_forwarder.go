@@ -3,8 +3,10 @@ package webrtc
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/pion/rtp"
@@ -115,6 +117,7 @@ type TrackForwarder struct {
 	wg          sync.WaitGroup
 	lifecycleMu sync.Mutex
 	queueSize   int
+	lastDropLog atomic.Int64
 }
 
 // NewTrackForwarder creates a forwarder for the given publisher track.
@@ -206,7 +209,23 @@ func (f *TrackForwarder) UpdatePublisher(publisher *WebRTCTrack) error {
 		// Local -> Local: keep not running.
 		f.running = false
 	}
+	queueSize := f.queueSize
 	f.mu.Unlock()
+
+	trackID := publisher.ID()
+	publisherID := ""
+	if dt := publisher.DomainTrack(); dt != nil {
+		if pub := dt.Publisher(); pub != nil {
+			publisherID = pub.ID()
+		}
+	}
+	slog.Default().Info("forwarder swapped",
+		"event", "forwarder_swapped",
+		"track_id", trackID,
+		"publisher_id", publisherID,
+		"is_remote", isRemoteNew,
+		"queue_size", queueSize,
+	)
 	return nil
 }
 
@@ -380,7 +399,23 @@ func (f *TrackForwarder) Start() error {
 	if !f.publisher.IsRemote() {
 		// TrackLocal placeholder: no run goroutine, IsRunning stays false.
 		f.running = false
+		trackID := f.publisher.ID()
+		publisherID := ""
+		if dt := f.publisher.DomainTrack(); dt != nil {
+			if pub := dt.Publisher(); pub != nil {
+				publisherID = pub.ID()
+			}
+		}
+		queueSize := f.queueSize
+		isRemote := false
 		f.mu.Unlock()
+		slog.Default().Info("forwarder start",
+			"event", "forwarder_start",
+			"track_id", trackID,
+			"publisher_id", publisherID,
+			"is_remote", isRemote,
+			"queue_size", queueSize,
+		)
 		return nil
 	}
 
@@ -388,10 +423,25 @@ func (f *TrackForwarder) Start() error {
 	f.ctx = ctx
 	f.cancel = cancel
 	f.running = true
+	trackID := f.publisher.ID()
+	publisherID := ""
+	if dt := f.publisher.DomainTrack(); dt != nil {
+		if pub := dt.Publisher(); pub != nil {
+			publisherID = pub.ID()
+		}
+	}
+	queueSize := f.queueSize
+	isRemote := true
 	f.wg.Add(1)
 	go f.run(ctx)
 	f.mu.Unlock()
-
+	slog.Default().Info("forwarder start",
+		"event", "forwarder_start",
+		"track_id", trackID,
+		"publisher_id", publisherID,
+		"is_remote", isRemote,
+		"queue_size", queueSize,
+	)
 	return nil
 }
 
@@ -421,6 +471,19 @@ func (f *TrackForwarder) Stop() error {
 	for _, e := range subs {
 		delete(f.subscribers, e.pc)
 	}
+	trackID := ""
+	publisherID := ""
+	queueSize := f.queueSize
+	isRemote := false
+	if f.publisher != nil {
+		trackID = f.publisher.ID()
+		isRemote = f.publisher.IsRemote()
+		if dt := f.publisher.DomainTrack(); dt != nil {
+			if pub := dt.Publisher(); pub != nil {
+				publisherID = pub.ID()
+			}
+		}
+	}
 	f.mu.Unlock()
 
 	if wasRunning {
@@ -441,19 +504,23 @@ func (f *TrackForwarder) Stop() error {
 		<-e.done
 	}
 
+	// Log outside locks.
+	if trackID != "" {
+		slog.Default().Info("forwarder stop",
+			"event", "forwarder_stop",
+			"track_id", trackID,
+			"publisher_id", publisherID,
+			"is_remote", isRemote,
+			"queue_size", queueSize,
+		)
+	}
+
 	if len(subs) == 0 {
 		return nil
 	}
 
 	// Remove forwarded tracks from subscribers; best-effort, ignore errors
 	// from closed PCs.
-	trackID := ""
-	f.mu.RLock()
-	if f.publisher != nil {
-		trackID = f.publisher.ID()
-	}
-	f.mu.RUnlock()
-	// Fallback to entry's track ID if publisher already nil (should not happen).
 	if trackID == "" && len(subs) > 0 && subs[0].webTrack != nil {
 		trackID = subs[0].webTrack.ID()
 	}
@@ -485,12 +552,38 @@ func (f *TrackForwarder) WriteRTP(pkt *rtp.Packet) error {
 	}
 	f.mu.RUnlock()
 
+	trackID := ""
+	f.mu.RLock()
+	if f.publisher != nil {
+		trackID = f.publisher.ID()
+	}
+	f.mu.RUnlock()
 	for _, e := range entries {
 		clone := clonePacket(pkt)
 		select {
 		case e.queue <- clone:
 		default:
-			atomic.AddUint64(&e.droppedCount, 1)
+			dropped := atomic.AddUint64(&e.droppedCount, 1)
+			queueDepth := len(e.queue)
+			subscriberID := ""
+			if e.pc != nil {
+				if p := e.pc.Participant(); p != nil {
+					subscriberID = p.ID()
+				}
+			}
+			now := time.Now().UnixNano()
+			last := f.lastDropLog.Load()
+			if now-last >= int64(time.Second) {
+				if f.lastDropLog.CompareAndSwap(last, now) {
+					slog.Default().Warn("queue dropped",
+						"event", "queue_dropped",
+						"track_id", trackID,
+						"subscriber_id", subscriberID,
+						"dropped_total", dropped,
+						"queue_depth", queueDepth,
+					)
+				}
+			}
 		}
 	}
 	return nil
@@ -529,6 +622,29 @@ func (f *TrackForwarder) TotalDropped() uint64 {
 		total += atomic.LoadUint64(&e.droppedCount)
 	}
 	return total
+}
+
+// MaxQueueDepth returns the maximum queue depth across all subscribers.
+func (f *TrackForwarder) MaxQueueDepth() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	max := 0
+	for _, e := range f.subscribers {
+		if n := len(e.queue); n > max {
+			max = n
+		}
+	}
+	return max
+}
+
+// ResetDropped clears dropped counters for all subscribers. Intended for tests.
+func (f *TrackForwarder) ResetDropped() {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for _, e := range f.subscribers {
+		atomic.StoreUint64(&e.droppedCount, 0)
+	}
+	f.lastDropLog.Store(0)
 }
 
 // Write forwards a raw RTP buffer to every subscriber by unmarshaling it

@@ -590,8 +590,12 @@ func (pc *PeerConnection) handleTrack(track *webrtc.TrackRemote, receiver *webrt
 	_ = receiver
 
 	participantID := ""
+	roomID := ""
 	if p := pc.Participant(); p != nil {
 		participantID = p.ID()
+		if r := p.Room(); r != nil {
+			roomID = r.ID()
+		}
 	}
 
 	// Create a domain track for the remote track
@@ -603,6 +607,7 @@ func (pc *PeerConnection) handleTrack(track *webrtc.TrackRemote, receiver *webrt
 		pc.logger.Error("failed to wrap remote track in a domain track",
 			"event", "remote_track_rejected",
 			"participant_id", participantID,
+			"room_id", roomID,
 			"track_id", track.ID(),
 			"error", err,
 		)
@@ -617,6 +622,16 @@ func (pc *PeerConnection) handleTrack(track *webrtc.TrackRemote, receiver *webrt
 	callback := pc.onTrack
 	pc.mu.Unlock()
 
+	trackID := track.ID()
+	trackKind := kind.String()
+	pc.logger.Info("track available",
+		"event", "track_available",
+		"room_id", roomID,
+		"participant_id", participantID,
+		"track_id", trackID,
+		"kind", trackKind,
+	)
+
 	// Invoke outside the lock so callbacks may re-enter PeerConnection
 	// methods without deadlocking.
 	if callback != nil {
@@ -626,53 +641,69 @@ func (pc *PeerConnection) handleTrack(track *webrtc.TrackRemote, receiver *webrt
 
 // handleConnectionStateChange is called when the connection state changes.
 func (pc *PeerConnection) handleConnectionStateChange(state webrtc.PeerConnectionState) {
+	// Snapshot IDs under lock, then log outside to avoid holding mu while logging.
+	var participantID string
+	var roomID string
 	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
-	participantID := ""
 	if pc.participant != nil {
 		participantID = pc.participant.ID()
+		if r := pc.participant.Room(); r != nil {
+			roomID = r.ID()
+		}
 	}
-
 	switch state {
 	case webrtc.PeerConnectionStateNew:
 		pc.state = PeerConnectionStateNew
 	case webrtc.PeerConnectionStateConnecting:
 		pc.state = PeerConnectionStateConnecting
+	case webrtc.PeerConnectionStateConnected:
+		pc.state = PeerConnectionStateConnected
+	case webrtc.PeerConnectionStateDisconnected:
+		pc.state = PeerConnectionStateDisconnected
+	case webrtc.PeerConnectionStateFailed:
+		pc.state = PeerConnectionStateFailed
+		ConnectionMetrics.IncrementFailures()
+	case webrtc.PeerConnectionStateClosed:
+		pc.state = PeerConnectionStateClosed
+	}
+	pc.mu.Unlock()
+
+	switch state {
+	case webrtc.PeerConnectionStateConnecting:
 		pc.logger.Debug("webrtc connection state changed",
 			"event", "connection_state",
+			"room_id", roomID,
 			"participant_id", participantID,
 			"state", "connecting",
 		)
 	case webrtc.PeerConnectionStateConnected:
-		pc.state = PeerConnectionStateConnected
 		pc.logger.Info("webrtc connection established",
-			"event", "connection_state",
+			"event", "peer_connected",
+			"room_id", roomID,
 			"participant_id", participantID,
 			"state", "connected",
-			"attempts", ConnectionMetrics.AttemptsTotal(),
-			"failures", ConnectionMetrics.FailuresTotal(),
 		)
 	case webrtc.PeerConnectionStateDisconnected:
-		pc.state = PeerConnectionStateDisconnected
 		pc.logger.Warn("webrtc connection disconnected",
-			"event", "connection_state",
+			"event", "peer_disconnected",
+			"room_id", roomID,
 			"participant_id", participantID,
 			"state", "disconnected",
 		)
 	case webrtc.PeerConnectionStateFailed:
-		pc.state = PeerConnectionStateFailed
-		ConnectionMetrics.IncrementFailures()
+		failures := ConnectionMetrics.FailuresTotal()
 		pc.logger.Warn("webrtc connection failed",
-			"event", "connection_state",
+			"event", "peer_failed",
+			"room_id", roomID,
 			"participant_id", participantID,
 			"state", "failed",
+			"failures_total", failures,
 			"error", "peer connection entered failed state",
 		)
 	case webrtc.PeerConnectionStateClosed:
-		pc.state = PeerConnectionStateClosed
 		pc.logger.Debug("webrtc connection closed",
 			"event", "connection_state",
+			"room_id", roomID,
 			"participant_id", participantID,
 			"state", "closed",
 		)
