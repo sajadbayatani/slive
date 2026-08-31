@@ -160,6 +160,95 @@ For detailed message formats and examples, see [docs/signaling-protocol.md](docs
 
 ---
 
+## Go SDK (`pkg/slive`)
+
+`github.com/sajadbayatani/slive/pkg/slive` is the stable, SemVer-versioned Go
+API for Slive. Slive is infrastructure, not an application: the SDK gives you
+rooms, participants, tracks, SFU signaling and health diagnostics, and you own
+the product layer above it. `internal/*` stays unstable, so import `pkg/slive`
+instead of reaching into it.
+
+> The SDK is Go-only and single-node in this release. There are no JS/TS
+> bindings yet — browsers talk to the signaling WebSocket endpoint directly.
+
+### Install
+
+```bash
+go get github.com/sajadbayatani/slive/pkg/slive
+```
+
+Requires Go 1.24 or newer.
+
+### Minimal example
+
+The whole required flow — `NewClient`, `JoinRoom`, `PublishTrack`,
+`SubscribeTrack`, `Snapshot`, `LeaveRoom`, `Close` — in 20 lines:
+
+```go
+package main
+import (
+	"context"
+	"log"
+	"github.com/sajadbayatani/slive/pkg/slive"
+)
+func main() {
+	client, err := slive.NewClient(slive.SDKConfig{STUNServers: []string{}}) // STUN-free: nothing leaves this process
+	if err != nil { log.Fatal(err) }
+	defer client.Close()
+	ctx := context.Background()
+	room, err := client.JoinRoom(ctx, "room-001", "alice")
+	if err != nil { log.Fatal(err) }
+	track, err := client.PublishTrack(ctx, room.ID(), "alice", "mic-001", slive.TrackKindAudio, slive.TrackSourceMicrophone)
+	if err != nil { log.Fatal(err) }
+	if _, err := client.JoinRoom(ctx, room.ID(), "bob"); err != nil { log.Fatal(err) }
+	if err := client.SubscribeTrack(ctx, room.ID(), "bob", track.ID()); err != nil { log.Fatal(err) }
+	snapshot := client.Snapshot(); log.Printf("rooms=%d participants=%d tracks=%d", snapshot.RoomsActive, snapshot.ParticipantsActive, snapshot.TracksPublished)
+	if err := client.LeaveRoom(ctx, room.ID(), "alice"); err != nil { log.Fatal(err) }
+}
+```
+
+Counting rule for the 20-line budget: the fence is the *entire* program, and
+each error check is condensed onto one line — `gofmt` expands those
+`if err != nil { … }` one-liners when you paste the file, which is fine; the
+SDK calls are what fit the budget. `test/sdk` fails if this snippet stops being
+a complete program within 20 lines or stops calling every symbol above.
+
+Behaviour worth knowing from this snippet: `JoinRoom` is idempotent, so
+re-joining `alice` returns the same room rather than an
+`ErrParticipantAlreadyExists`; `PublishTrack`/`SubscribeTrack`/`LeaveRoom`
+distinguish their misses, returning `ErrRoomNotFound` for an unknown room and
+`ErrParticipantNotFound` for an unknown participant (`errors.Is` on both).
+Leaving a room destroys the tracks its publisher owned.
+
+`Client` methods manage room state in-process. To end up with real
+`TrackForwarder` subscribers — i.e. a non-zero
+`Snapshot().ForwarderSubscribers` — drive the WebSocket signaling protocol with
+`client.Connect(ctx, roomID, participantID)` and use the returned
+`*slive.Session` (`PublishTrack` / `SubscribeTrack` / `Close`). Serve
+`client.HTTPHandler()` (or dial it with `client.SignalingURL()`) to mount the
+production `/health`, `/healthz` and `/ws` routes without importing
+`internal/http`.
+
+### Runnable examples
+
+| Example | What it proves | Run |
+| --- | --- | --- |
+| [`basic-room`](examples/basic-room/README.md) | 1 room × 2 participants, `Snapshot()` gauges | `go run ./examples/basic-room` |
+| [`publish-subscribe`](examples/publish-subscribe/README.md) | real signaling sessions, `forwarder_subscribers >= 1` | `go run ./examples/publish-subscribe` |
+| [`health`](examples/health/README.md) | `Client.HTTPHandler()` serving `/healthz` with `status=ok` | `go run ./examples/health` |
+
+All three are STUN-free, exit 0, and finish in under 5 seconds. See
+[examples/README.md](examples/README.md) for the expected output of each.
+
+### API reference, stability and changelog
+
+- [docs/sdk.md](docs/sdk.md) — exported surface table (types, methods, options, error sentinels).
+- [pkg/slive doc.go](pkg/slive/doc.go) — the package contract, also via `go doc -all ./pkg/slive`.
+- [VERSIONING.md](VERSIONING.md) — SemVer rules, deprecation policy, stable vs unstable surface.
+- [CHANGELOG.md](CHANGELOG.md) — released versions; current SDK surface is `0.7.0`.
+
+---
+
 ## Running Tests
 
 Slive includes comprehensive tests for the core domain model and signaling layer.
@@ -210,15 +299,28 @@ make run
 ```text
 slive/
 ├── cmd/
-│   └── server/           # Main server entry point
+│   └── slive/            # Main server entry point
 ├── internal/
-│   ├── config/           # Configuration management
-│   ├── domain/           # Core domain model (Room, Participant, Track)
-│   ├── http/             # HTTP server and routing
-│   ├── logger/           # Logging infrastructure
-│   └── signaling/        # WebSocket signaling protocol
-├── docs/                 # Documentation
+│   ├── config/           # Configuration management (unstable)
+│   ├── domain/           # Core domain model: Room, Participant, Track (unstable)
+│   ├── http/             # HTTP server, health/healthz, router (unstable)
+│   ├── logger/           # Logging infrastructure (unstable)
+│   ├── signaling/        # WebSocket signaling protocol + SFU wiring (unstable)
+│   └── webrtc/           # Peer connections, TrackForwarder, metrics (unstable)
+├── pkg/
+│   └── slive/            # Stable public Go SDK facade (SemVer)
+├── examples/             # Runnable `go run` SDK examples
+│   ├── basic-room/
+│   ├── publish-subscribe/
+│   └── health/
+├── test/
+│   ├── e2e/              # Signaling/protocol end-to-end tests
+│   ├── scale/            # Single-node scale + capacity harness
+│   └── sdk/              # Public-surface and example-run tests
+├── docs/                 # Architecture, signaling protocol, SDK reference
 ├── Makefile              # Build and test commands
+├── VERSIONING.md         # SemVer + deprecation policy
+├── CHANGELOG.md          # Released versions
 └── go.mod/go.sum         # Go module files
 ```
 
