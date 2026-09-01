@@ -277,17 +277,24 @@ type ErrorResponse struct {
 
 // ErrorCodes for signaling errors.
 const (
-	ErrorCodeRoomNotFound         = "room_not_found"
-	ErrorCodeRoomClosed           = "room_closed"
-	ErrorCodeParticipantNotFound  = "participant_not_found"
-	ErrorCodeTrackNotFound        = "track_not_found"
-	ErrorCodeInvalidRequest       = "invalid_request"
-	ErrorCodeInternalError        = "internal_error"
-	ErrorCodeInvalidWebRTCMessage = "invalid_webrtc_message"
-	ErrorCodeConnectionNotFound   = "connection_not_found"
-	ErrorCodePeerConnectionClosed = "peer_connection_closed"
-	ErrorCodeNegotiationFailed    = "negotiation_failed"
-	ErrorCodeICEFailed            = "ice_failed"
+	ErrorCodeRoomNotFound             = "room_not_found"
+	ErrorCodeRoomClosed               = "room_closed"
+	ErrorCodeParticipantNotFound      = "participant_not_found"
+	ErrorCodeTrackNotFound            = "track_not_found"
+	ErrorCodeInvalidRequest           = "invalid_request"
+	ErrorCodeInternalError            = "internal_error"
+	ErrorCodeInvalidWebRTCMessage     = "invalid_webrtc_message"
+	ErrorCodeConnectionNotFound       = "connection_not_found"
+	ErrorCodePeerConnectionClosed     = "peer_connection_closed"
+	ErrorCodeNegotiationFailed        = "negotiation_failed"
+	ErrorCodeICEFailed                = "ice_failed"
+	ErrorCodeTrackAlreadyPublished    = "track_already_published"
+	ErrorCodeTrackAlreadySubscribed   = "track_already_subscribed"
+	ErrorCodeTrackNotPublished        = "track_not_published"
+	ErrorCodeParticipantAlreadyExists = "participant_already_exists"
+	ErrorCodeParticipantLeft          = "participant_left"
+	ErrorCodeInvalidTrackKind         = "invalid_track_kind"
+	ErrorCodeInvalidTrackSource       = "invalid_track_source"
 )
 
 // ErrInvalidRequest marks request payloads that failed validation; it is
@@ -337,12 +344,26 @@ func errorCodeFromDomainError(err error) string {
 	}
 
 	switch {
-	case err == domain.ErrRoomClosed:
+	case errors.Is(err, domain.ErrRoomClosed):
 		return ErrorCodeRoomClosed
-	case err == domain.ErrParticipantNotFound:
+	case errors.Is(err, domain.ErrParticipantNotFound):
 		return ErrorCodeParticipantNotFound
-	case err == domain.ErrTrackNotFound:
+	case errors.Is(err, domain.ErrTrackNotFound):
 		return ErrorCodeTrackNotFound
+	case errors.Is(err, domain.ErrTrackAlreadyPublished):
+		return ErrorCodeTrackAlreadyPublished
+	case errors.Is(err, domain.ErrTrackAlreadySubscribed):
+		return ErrorCodeTrackAlreadySubscribed
+	case errors.Is(err, domain.ErrTrackNotPublished):
+		return ErrorCodeTrackNotPublished
+	case errors.Is(err, domain.ErrParticipantAlreadyExists):
+		return ErrorCodeParticipantAlreadyExists
+	case errors.Is(err, domain.ErrParticipantLeft):
+		return ErrorCodeParticipantLeft
+	case errors.Is(err, domain.ErrInvalidTrackKind):
+		return ErrorCodeInvalidTrackKind
+	case errors.Is(err, domain.ErrInvalidTrackSource):
+		return ErrorCodeInvalidTrackSource
 	default:
 		return ErrorCodeInternalError
 	}

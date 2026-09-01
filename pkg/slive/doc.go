@@ -30,13 +30,12 @@
 //
 //   - Config shape SDKConfig and DefaultSDKConfig (GCParticipantTTL mirrors
 //     config.DefaultGCParticipantTTL, QueueSize mirrors webrtc.DefaultQueueSize
-//     64 — the shape is stable, the knob is reserved: it is normalized and
-//     recorded but not yet applied to forwarders).
+//     64 and is applied to forwarders via signaling.WithForwarderConfig).
 //   - Lifecycle types Room, Participant, Track, TrackKind, TrackSource and
 //     their accessor methods (ID, Kind, State, PublishTrack, SubscribeTrack,
 //     etc.). sync.RWMutex fields are not exported.
 //   - Client with NewClient, JoinRoom, LeaveRoom, PublishTrack, SubscribeTrack,
-//     UnsubscribeTrack, Snapshot, Close.
+//     UnsubscribeTrack, Snapshot, RoomIDs, CloseRoom, Close.
 //   - SDK helpers (TASK-032): Client.Connect returning a signaling Session
 //     (PublishTrack, SubscribeTrack, Close) that runs the real WebSocket
 //     protocol against the Handler, Client.HTTPHandler composing the
@@ -71,7 +70,9 @@
 // moving: RoomManager (with NewRoomManager and Client.RoomManager), Handler
 // (with NewHandler and Client.Handler), and PeerConnectionConfig. Use the
 // Client methods, Client.Connect and SDKConfig instead; these names may change
-// shape in any release, including a patch.
+// shape in any release, including a patch. Client.Handler is deprecated: use
+// HTTPHandler, Connect, RoomIDs or CloseRoom instead (test hooks on Handler are
+// gated behind //go:build slive_internal).
 //
 // # What is not exported
 //

@@ -712,10 +712,13 @@ func TestSignaling_ErrorCodes(t *testing.T) {
 		{"ParticipantNotFound", domain.ErrParticipantNotFound, ErrorCodeParticipantNotFound},
 		{"TrackNotFound", domain.ErrTrackNotFound, ErrorCodeTrackNotFound},
 		{"NilError", nil, ""},
-		{"ParticipantAlreadyExists", domain.ErrParticipantAlreadyExists, ErrorCodeInternalError},
-		{"ParticipantLeft", domain.ErrParticipantLeft, ErrorCodeInternalError},
-		{"TrackAlreadyPublished", domain.ErrTrackAlreadyPublished, ErrorCodeInternalError},
-		{"TrackAlreadySubscribed", domain.ErrTrackAlreadySubscribed, ErrorCodeInternalError},
+		{"ParticipantAlreadyExists", domain.ErrParticipantAlreadyExists, ErrorCodeParticipantAlreadyExists},
+		{"ParticipantLeft", domain.ErrParticipantLeft, ErrorCodeParticipantLeft},
+		{"TrackAlreadyPublished", domain.ErrTrackAlreadyPublished, ErrorCodeTrackAlreadyPublished},
+		{"TrackAlreadySubscribed", domain.ErrTrackAlreadySubscribed, ErrorCodeTrackAlreadySubscribed},
+		{"TrackNotPublished", domain.ErrTrackNotPublished, ErrorCodeTrackNotPublished},
+		{"InvalidTrackKind", domain.ErrInvalidTrackKind, ErrorCodeInvalidTrackKind},
+		{"InvalidTrackSource", domain.ErrInvalidTrackSource, ErrorCodeInvalidTrackSource},
 	}
 
 	for _, tt := range tests {

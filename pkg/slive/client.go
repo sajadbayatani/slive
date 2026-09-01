@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -53,13 +54,17 @@ type Client struct {
 	// sessions tracks open signaling sessions so Close can tear them down
 	// before shutting the handler (gorilla ws keeps the listener busy).
 	sessions map[*Session]struct{}
+	// closedRooms records roomIDs that have been closed via CloseRoom for
+	// idempotent semantics: a second CloseRoom on the same ID returns nil
+	// while an unknown ID still returns ErrRoomNotFound.
+	closedRooms map[string]struct{}
 }
 
 // NewClient creates a new Client with the given SDKConfig. Zero values are
 // normalized to defaults: GCParticipantTTL defaults to
 // config.DefaultGCParticipantTTL (60s), QueueSize defaults to DefaultQueueSize
-// (64), and nil Logger uses slog.Default(). QueueSize is recorded only — it is
-// a reserved knob that no forwarder consumes yet, see SDKConfig.QueueSize.
+// (64) and is plumbed to the signaling handler's forwarder config, and nil
+// Logger uses slog.Default().
 // STUNServers nil uses the signaling default; pass an empty slice to force
 // STUN-free (useful for offline tests).
 func NewClient(cfg SDKConfig) (*Client, error) {
@@ -101,10 +106,14 @@ func NewClient(cfg SDKConfig) (*Client, error) {
 		pcCfg.Logger = cfg.Logger
 	}
 
+	fwdCfg := webrtc.ForwarderConfig{QueueSize: cfg.QueueSize}
+
 	h := signaling.NewHandler(rm,
 		signaling.WithGCTTL(cfg.GCParticipantTTL),
 		signaling.WithPeerConnectionConfig(pcCfg),
 		signaling.WithLogger(cfg.Logger),
+		signaling.WithForwarderConfig(fwdCfg),
+		signaling.WithAllowedOrigins(cfg.AllowedOrigins),
 	)
 
 	return &Client{
@@ -126,7 +135,7 @@ func (c *Client) JoinRoom(ctx context.Context, roomID, participantID string) (*R
 		return nil, err
 	}
 	if roomID == "" || participantID == "" {
-		return nil, fmt.Errorf("roomID and participantID are required")
+		return nil, fmt.Errorf("%w: roomID and participantID are required", ErrInvalidArgument)
 	}
 
 	// The whole create-room / check-participant / join sequence is one
@@ -137,12 +146,16 @@ func (c *Client) JoinRoom(ctx context.Context, roomID, participantID string) (*R
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return nil, fmt.Errorf("client is closed")
+		return nil, fmt.Errorf("%w: client is closed", ErrClientClosed)
 	}
 
 	room, err := c.roomManager.GetOrCreateRoom(roomID)
 	if err != nil {
 		return nil, err
+	}
+	// Clear idempotent CloseRoom record so a re-created room can be closed again.
+	if c.closedRooms != nil {
+		delete(c.closedRooms, roomID)
 	}
 
 	// If participant already exists, return the room as-is (idempotent join).
@@ -265,8 +278,121 @@ func (c *Client) RoomManager() *RoomManager {
 }
 
 // Handler returns the underlying signaling Handler.
+//
+// Deprecated: Use HTTPHandler, Connect, or the new lifecycle methods RoomIDs and CloseRoom instead.
+// The Handler is an unstable alias for signaling.Handler whose exported test hooks are gated behind
+// //go:build slive_internal and whose surface may change in any release. Prefer Client methods.
 func (c *Client) Handler() *Handler {
 	return c.handler
+}
+
+// RoomIDs returns a snapshot of active room IDs, sorted deterministically.
+// It is safe for concurrent use.
+func (c *Client) RoomIDs() []string {
+	if c.roomManager == nil {
+		return nil
+	}
+	ids := c.roomManager.RoomIDs()
+	sort.Strings(ids)
+	return ids
+}
+
+// CloseRoom closes the room with roomID via the canonical teardown: per-participant
+// Leave, forwarder stops, and manager removal. It returns ErrRoomNotFound for
+// unknown rooms and is idempotent — closing an already-closed room returns nil.
+// The context is checked before blocking operations.
+func (c *Client) CloseRoom(ctx context.Context, roomID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if roomID == "" {
+		return fmt.Errorf("%w: roomID is required", ErrInvalidArgument)
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return fmt.Errorf("%w: client is closed", ErrClientClosed)
+	}
+	c.mu.Unlock()
+
+	room := c.roomManager.GetRoom(roomID)
+	if room == nil {
+		c.mu.Lock()
+		if c.closedRooms != nil {
+			if _, ok := c.closedRooms[roomID]; ok {
+				c.mu.Unlock()
+				return nil
+			}
+		}
+		c.mu.Unlock()
+		return ErrRoomNotFound
+	}
+	// If room was previously closed and re-created, clear the idempotent record so
+	// the new instance can be closed again.
+	c.mu.Lock()
+	if c.closedRooms != nil {
+		delete(c.closedRooms, roomID)
+	}
+	c.mu.Unlock()
+
+	// Snapshot participants and tracks before teardown.
+	participantIDs := room.Participants()
+	trackIDs := room.Tracks()
+
+	// Clean up signaling resources if handler is present.
+	if c.handler != nil {
+		if err := c.handler.CloseRoom(roomID); err != nil {
+			if errors.Is(err, signaling.ErrRoomNotFound) || errors.Is(err, domain.ErrParticipantNotFound) {
+				// We already verified room existed via GetRoom, so this is a concurrent
+				// close race — treat as idempotent success.
+				c.mu.Lock()
+				if c.closedRooms == nil {
+					c.closedRooms = make(map[string]struct{})
+				}
+				c.closedRooms[roomID] = struct{}{}
+				c.mu.Unlock()
+				return nil
+			}
+			return err
+		}
+		// Handler.CloseRoom already removed the room from manager, so record idempotency.
+		c.mu.Lock()
+		if c.closedRooms == nil {
+			c.closedRooms = make(map[string]struct{})
+		}
+		c.closedRooms[roomID] = struct{}{}
+		c.mu.Unlock()
+		return nil
+	}
+
+	// No handler path: per-participant Leave via Room, then manager removal.
+	for _, pid := range participantIDs {
+		_ = room.Leave(pid)
+	}
+	_ = trackIDs
+	if err := c.roomManager.CloseRoom(roomID); err != nil {
+		if errors.Is(err, signaling.ErrRoomNotFound) || errors.Is(err, domain.ErrParticipantNotFound) {
+			c.mu.Lock()
+			if c.closedRooms == nil {
+				c.closedRooms = make(map[string]struct{})
+			}
+			// If we had seen the room, this is a race — idempotent.
+			if _, ok := c.closedRooms[roomID]; ok {
+				c.mu.Unlock()
+				return nil
+			}
+			c.mu.Unlock()
+			return ErrRoomNotFound
+		}
+		return err
+	}
+	c.mu.Lock()
+	if c.closedRooms == nil {
+		c.closedRooms = make(map[string]struct{})
+	}
+	c.closedRooms[roomID] = struct{}{}
+	c.mu.Unlock()
+	return nil
 }
 
 // HTTPHandler returns an http.Handler that mounts the client's real HTTP
@@ -298,7 +424,7 @@ func (c *Client) SignalingURL() (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return "", fmt.Errorf("client is closed")
+		return "", fmt.Errorf("%w: client is closed", ErrClientClosed)
 	}
 	if c.srv == nil {
 		ln, err := net.Listen("tcp", signalingLoopbackBind)

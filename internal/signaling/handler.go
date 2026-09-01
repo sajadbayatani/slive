@@ -38,6 +38,9 @@ type Handler struct {
 	// this handler.
 	logger *slog.Logger
 
+	// forwarderConfig is used for every TrackForwarder this handler creates.
+	forwarderConfig webrtc.ForwarderConfig
+
 	// GC state for ghost participants whose transport dropped without explicit leave.
 	gcTTL         time.Duration
 	gcTicker      *time.Ticker
@@ -45,6 +48,12 @@ type Handler struct {
 	ghostTimers   map[string]*time.Timer
 	gcMu          sync.Mutex
 	gcReapedCount uint64
+
+	// WebSocket policy and deadlines.
+	allowedOrigins []string
+	wsReadTimeout  time.Duration
+	wsPingInterval time.Duration
+	wsWriteTimeout time.Duration
 }
 
 // HandlerOption customises a Handler at construction time.
@@ -70,11 +79,55 @@ func WithLogger(logger *slog.Logger) HandlerOption {
 	}
 }
 
+// WithForwarderConfig sets the ForwarderConfig used for every TrackForwarder
+// created by the handler. Zero value keeps today's behavior (DefaultQueueSize 64).
+func WithForwarderConfig(cfg webrtc.ForwarderConfig) HandlerOption {
+	return func(h *Handler) {
+		h.forwarderConfig = cfg
+	}
+}
+
 // WithGCTTL sets the ghost-participant GC TTL. A TTL of 0 disables GC.
 // Default is 60s. Exposed for config wiring and tests (TTL 100ms in tests).
 func WithGCTTL(d time.Duration) HandlerOption {
 	return func(h *Handler) {
 		h.gcTTL = d
+	}
+}
+
+// WithAllowedOrigins sets the allowlist for cross-origin WebSocket requests.
+// Implements D1: no-Origin allowed, same-origin allowed, exact allowlist matches allowed.
+func WithAllowedOrigins(origins []string) HandlerOption {
+	return func(h *Handler) {
+		if origins == nil {
+			h.allowedOrigins = nil
+			return
+		}
+		cp := make([]string, len(origins))
+		copy(cp, origins)
+		h.allowedOrigins = cp
+	}
+}
+
+// WithWSReadTimeout sets the WebSocket read deadline. Zero uses default 60s.
+func WithWSReadTimeout(d time.Duration) HandlerOption {
+	return func(h *Handler) {
+		h.wsReadTimeout = d
+	}
+}
+
+// WithWSPingInterval sets the ping interval. Zero uses default 30s.
+// Enforced ≤ ReadTimeout/2 at construction.
+func WithWSPingInterval(d time.Duration) HandlerOption {
+	return func(h *Handler) {
+		h.wsPingInterval = d
+	}
+}
+
+// WithWSWriteTimeout sets the WebSocket write deadline. Zero uses default 10s.
+func WithWSWriteTimeout(d time.Duration) HandlerOption {
+	return func(h *Handler) {
+		h.wsWriteTimeout = d
 	}
 }
 
@@ -89,6 +142,9 @@ func NewHandler(roomManager *RoomManager, opts ...HandlerOption) *Handler {
 		logger:               slog.Default(),
 		gcTTL:                60 * time.Second,
 		ghostTimers:          make(map[string]*time.Timer),
+		wsReadTimeout:        DefaultWSReadTimeout,
+		wsPingInterval:       DefaultWSPingInterval,
+		wsWriteTimeout:       DefaultWSWriteTimeout,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -98,12 +154,48 @@ func NewHandler(roomManager *RoomManager, opts ...HandlerOption) *Handler {
 	if h.ghostTimers == nil {
 		h.ghostTimers = make(map[string]*time.Timer)
 	}
+	if h.wsReadTimeout <= 0 {
+		h.wsReadTimeout = DefaultWSReadTimeout
+	}
+	if h.wsWriteTimeout <= 0 {
+		h.wsWriteTimeout = DefaultWSWriteTimeout
+	}
+	if h.wsPingInterval <= 0 {
+		h.wsPingInterval = DefaultWSPingInterval
+	}
+	if h.wsPingInterval > h.wsReadTimeout/2 {
+		h.wsPingInterval = h.wsReadTimeout / 2
+	}
 	return h
 }
 
 // GCReapedCount returns the number of ghost participants reaped.
 func (h *Handler) GCReapedCount() uint64 {
 	return atomic.LoadUint64(&h.gcReapedCount)
+}
+
+// CloseRoom closes the room with roomID via canonical teardown: per-participant
+// Leave is handled by Room.Close, forwarders for the room's tracks are stopped,
+// peer connections for participants in the room are closed, ghost timers cancelled,
+// and the room is removed from the manager. It returns ErrRoomNotFound for unknown rooms.
+func (h *Handler) CloseRoom(roomID string) error {
+	room := h.roomManager.GetRoom(roomID)
+	if room == nil {
+		return ErrRoomNotFound
+	}
+	participantIDs := room.Participants()
+	trackIDs := room.Tracks()
+	for _, tid := range trackIDs {
+		h.removeForwarder(tid)
+	}
+	for _, pid := range participantIDs {
+		if pc := h.getPeerConnection(pid); pc != nil {
+			h.removeSubscriberFromAllForwarders(pc)
+		}
+		h.closePeerConnection(pid)
+		h.cancelGhostTimer(pid)
+	}
+	return h.roomManager.CloseRoom(roomID)
 }
 
 // Shutdown gracefully shuts down all WebSocket connections and peer connections
@@ -174,7 +266,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create a new WebSocket connection
-	conn, err := NewConnection(h.logger, w, r, roomID, participantID)
+	conn, err := NewConnectionWithConfig(h.logger, w, r, roomID, participantID, h.allowedOrigins, h.wsReadTimeout, h.wsPingInterval, h.wsWriteTimeout)
 	if err != nil {
 		h.logger.Error("failed to upgrade websocket connection",
 			"event", "ws_upgrade_failed",
@@ -466,7 +558,7 @@ func (h *Handler) getOrCreateForwarder(trackID string, publisherTrack *webrtc.We
 		}
 		return fw, nil
 	}
-	fw, err := webrtc.NewTrackForwarder(publisherTrack)
+	fw, err := webrtc.NewTrackForwarderWithConfig(publisherTrack, h.forwarderConfig)
 	if err != nil {
 		return nil, err
 	}

@@ -81,7 +81,7 @@ type Session struct {
 // reuses its session state. Close the Session when done.
 func (c *Client) Connect(ctx context.Context, roomID, participantID string) (*Session, error) {
 	if roomID == "" || participantID == "" {
-		return nil, fmt.Errorf("roomID and participantID are required")
+		return nil, fmt.Errorf("%w: roomID and participantID are required", ErrInvalidArgument)
 	}
 	base, err := c.SignalingURL()
 	if err != nil {
@@ -347,11 +347,10 @@ func newSessionError(want signaling.MessageType, reply signaling.ErrorResponse) 
 }
 
 // sentinelForErrorReply maps a signaling ErrorResponse to the frozen pkg/slive
-// sentinel it identifies. The wire code is authoritative; the message text is
-// the fallback because internal/signaling still collapses several domain
-// errors into internal_error — notably track_already_published, which reaches
-// the client as internal_error carrying the domain text. Unrecognized replies
-// map to nil, so no identity is claimed for them.
+// sentinel it identifies. The wire code is authoritative; the message text
+// fallback is legacy belt-and-braces for any pre-code replies that may still
+// carry domain text with ErrorCodeInternalError. Unrecognized replies map to
+// nil, so no identity is claimed for them.
 func sentinelForErrorReply(reply signaling.ErrorResponse) error {
 	switch reply.Code {
 	case signaling.ErrorCodeRoomClosed:
@@ -364,8 +363,24 @@ func sentinelForErrorReply(reply signaling.ErrorResponse) error {
 		return ErrTrackNotFound
 	case signaling.ErrorCodePeerConnectionClosed:
 		return ErrPeerConnectionClosed
+	case signaling.ErrorCodeTrackAlreadyPublished:
+		return ErrTrackAlreadyPublished
+	case signaling.ErrorCodeTrackAlreadySubscribed:
+		return ErrTrackAlreadySubscribed
+	case signaling.ErrorCodeTrackNotPublished:
+		return ErrTrackNotPublished
+	case signaling.ErrorCodeParticipantAlreadyExists:
+		return ErrParticipantAlreadyExists
+	case signaling.ErrorCodeParticipantLeft:
+		return ErrParticipantLeft
+	case signaling.ErrorCodeInvalidTrackKind:
+		return ErrInvalidTrackKind
+	case signaling.ErrorCodeInvalidTrackSource:
+		return ErrInvalidTrackSource
 	}
 
+	// Legacy text fallback: retained as belt-and-braces for any
+	// internal_error reply that still carries domain text.
 	text := strings.ToLower(reply.Error)
 	for _, m := range sentinelByText {
 		if strings.Contains(text, m.text) {

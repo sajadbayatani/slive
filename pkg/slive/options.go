@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/sajadbayatani/slive/internal/signaling"
+	"github.com/sajadbayatani/slive/internal/webrtc"
 )
 
 // NewRoomManager creates a new RoomManager. It is a stable wrapper for
@@ -41,9 +42,39 @@ type DiagnosticsSnapshoter interface {
 	Snapshot() MetricsSnapshot
 }
 
+// WithForwarderConfig sets the ForwarderConfig used for every TrackForwarder
+// created by the handler. It mirrors signaling.WithForwarderConfig.
+func WithForwarderConfig(cfg ForwarderConfig) HandlerOption {
+	return signaling.WithForwarderConfig(webrtc.ForwarderConfig(cfg))
+}
+
 // WithDiagnosticsSnapshoter wires a DiagnosticsSnapshoter as a health source.
 // For Handler it is a no-op; it exists for API stability. See
 // DiagnosticsSnapshoter and MetricsSnapshot for the response shape.
 func WithDiagnosticsSnapshoter(s DiagnosticsSnapshoter) HandlerOption {
 	return func(h *Handler) {}
+}
+
+// WithAllowedOrigins sets the allowlist for cross-origin WebSocket requests.
+// It mirrors signaling.WithAllowedOrigins.
+func WithAllowedOrigins(origins []string) HandlerOption {
+	return signaling.WithAllowedOrigins(origins)
+}
+
+// WithWSReadTimeout sets the WebSocket read deadline on a Handler.
+// It mirrors signaling.WithWSReadTimeout.
+func WithWSReadTimeout(d time.Duration) HandlerOption {
+	return signaling.WithWSReadTimeout(d)
+}
+
+// WithWSPingInterval sets the WebSocket ping interval on a Handler.
+// It mirrors signaling.WithWSPingInterval.
+func WithWSPingInterval(d time.Duration) HandlerOption {
+	return signaling.WithWSPingInterval(d)
+}
+
+// WithWSWriteTimeout sets the WebSocket write deadline on a Handler.
+// It mirrors signaling.WithWSWriteTimeout.
+func WithWSWriteTimeout(d time.Duration) HandlerOption {
+	return signaling.WithWSWriteTimeout(d)
 }

@@ -150,7 +150,14 @@ func TestErrorCodeFromDomainError(t *testing.T) {
 		{"ParticipantNotFound", domain.ErrParticipantNotFound, ErrorCodeParticipantNotFound},
 		{"TrackNotFound", domain.ErrTrackNotFound, ErrorCodeTrackNotFound},
 		{"NilError", nil, ""},
-		{"UnknownError", domain.ErrParticipantAlreadyExists, ErrorCodeInternalError},
+		{"TrackAlreadyPublished", domain.ErrTrackAlreadyPublished, ErrorCodeTrackAlreadyPublished},
+		{"TrackAlreadySubscribed", domain.ErrTrackAlreadySubscribed, ErrorCodeTrackAlreadySubscribed},
+		{"TrackNotPublished", domain.ErrTrackNotPublished, ErrorCodeTrackNotPublished},
+		{"ParticipantAlreadyExists", domain.ErrParticipantAlreadyExists, ErrorCodeParticipantAlreadyExists},
+		{"ParticipantLeft", domain.ErrParticipantLeft, ErrorCodeParticipantLeft},
+		{"InvalidTrackKind", domain.ErrInvalidTrackKind, ErrorCodeInvalidTrackKind},
+		{"InvalidTrackSource", domain.ErrInvalidTrackSource, ErrorCodeInvalidTrackSource},
+		{"UnknownWrapped", fmt.Errorf("wrapping: %w", domain.ErrTrackAlreadyPublished), ErrorCodeTrackAlreadyPublished},
 	}
 
 	for _, tt := range tests {
@@ -190,7 +197,8 @@ func TestErrorCodeFromError(t *testing.T) {
 		{"DomainRoomClosed", domain.ErrRoomClosed, ErrorCodeRoomClosed},
 		{"DomainParticipantNotFound", domain.ErrParticipantNotFound, ErrorCodeParticipantNotFound},
 		{"DomainTrackNotFound", domain.ErrTrackNotFound, ErrorCodeTrackNotFound},
-		{"DomainUnknown", domain.ErrParticipantAlreadyExists, ErrorCodeInternalError},
+		{"DomainParticipantAlreadyExists", domain.ErrParticipantAlreadyExists, ErrorCodeParticipantAlreadyExists},
+		{"DomainTrackAlreadyPublished", domain.ErrTrackAlreadyPublished, ErrorCodeTrackAlreadyPublished},
 	}
 
 	for _, tt := range tests {

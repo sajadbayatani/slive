@@ -25,16 +25,15 @@ type SDKConfig struct {
 	GCParticipantTTL time.Duration
 	// QueueSize is the per-subscriber RTP queue capacity for
 	// webrtc.ForwarderConfig. Zero or negative uses webrtc.DefaultQueueSize
-	// (64).
-	//
-	// Reserved: the value is normalized and recorded on the SDKConfig, but it
-	// is not applied to forwarders yet — signaling.NewHandler accepts no
-	// forwarder option, so every TrackForwarder keeps DefaultQueueSize.
-	// Plumbing it is pending an internal signaling option (sprint-08); do not
-	// rely on this knob changing behaviour in the meantime.
+	// (64). The value is normalized by NewClient and plumbed to
+	// signaling.WithForwarderConfig so every TrackForwarder uses it.
 	QueueSize int
 	// Logger receives structured lifecycle events. Nil uses slog.Default().
 	Logger *slog.Logger
+	// AllowedOrigins is the allowlist for cross-origin WebSocket requests.
+	// It is additive to the D1 defaults (no-Origin and same-origin allowed).
+	// Origin values are matched exactly; e.g. "https://example.com".
+	AllowedOrigins []string
 }
 
 // Config is an alias for SDKConfig for compatibility with older documentation

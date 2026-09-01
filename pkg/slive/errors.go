@@ -61,6 +61,14 @@ var (
 	ErrTrackNotPublished = domain.ErrTrackNotPublished
 )
 
+// Client lifecycle / validation errors.
+var (
+	// ErrClientClosed is returned when an operation targets a closed Client.
+	ErrClientClosed = errors.New("client is closed")
+	// ErrInvalidArgument is returned when required arguments are missing or invalid.
+	ErrInvalidArgument = errors.New("invalid argument")
+)
+
 // WebRTC / signaling errors.
 var (
 	// ErrTrackNotReady is returned when a track is not ready for operations.
