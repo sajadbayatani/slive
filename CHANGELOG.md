@@ -80,6 +80,14 @@ each release's **Known issues**.
 
 ---
 
+## [0.8.0] — 2026-09-01 (sprint-09: release & distribution pipeline)
+
+### Added
+
+* **Release & distribution pipeline (TASK-039–042, sprint-09):** reproducible builds via `main.version`/`commit`/`date` ldflags (`CGO_ENABLED=0`, `-trimpath`), `Makefile` `VERSION`/`COMMIT`/`DATE` + `build`/`dist`/`cover` targets, `Dockerfile` OCI labels, `.github/workflows/ci.yml` (lint/test/sdk-smoke/coverage with `GOMODCACHE` caching and `coverage.out` artifact), `.github/workflows/release.yml` (`v*` tag trigger, `validate` → `build` matrix `linux/darwin × amd64/arm64` → `release` via `softprops/action-gh-release@v2` with `checksums.txt` → `docker` multi-arch `linux/amd64,linux/arm64` to `sajadbayatani/slive` with semver tagging), `docs/RELEASE.md` procedure/checklist and README badges (CI/Coverage/Release/Docker). No `internal/*`/`pkg/*`/`cmd/*` logic change; `VERSIONING.md` contract unchanged.
+
+---
+
 ## [0.7.0] — 2026-08-31 (sprint-07: SDK and API maturity)
 
 Freezes the first stable public Go surface for Slive and documents the

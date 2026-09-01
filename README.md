@@ -1,5 +1,11 @@
 # slive
 
+[![CI](https://github.com/sajadbayatani/slive/actions/workflows/ci.yml/badge.svg)](https://github.com/sajadbayatani/slive/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-go%20cover-blue)](https://github.com/sajadbayatani/slive/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/sajadbayatani/slive?label=release)](https://github.com/sajadbayatani/slive/releases)
+[![Docker](https://img.shields.io/docker/pulls/sajadbayatani/slive)](https://hub.docker.com/r/sajadbayatani/slive)
+[![Docker Image Version](https://img.shields.io/docker/v/sajadbayatani/slive?label=docker)](https://hub.docker.com/r/sajadbayatani/slive/tags)
+
 A self-hosted realtime communication server written in Go.
 
 `slive` is an open-source realtime communication infrastructure
