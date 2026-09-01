@@ -76,40 +76,40 @@ The core domain model consists of three main entities:
 ### Architecture Diagram
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│                        HTTP Server                              │
+┌───────────────────────────────────────────────────────────────┐
+│                        HTTP Server                            │
 │  ┌─────────────────────────────────────────────────────────┐  │
-│  │                    Router                                  │  │
+│  │                    Router                               │  │
 │  │  /health → HealthHandler                                │  │
 │  │  /ws/{roomId} → signaling.Handler                       │  │
 │  └─────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    Signaling Layer                              │
+│                    Signaling Layer                          │
 │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────┐  │
-│  │  Connection      │  │  Connection      │  │ Room         │  │
-│  │  Manager         │  │  (WebSocket)     │  │ Manager      │  │
+│  │  Connection     │  │  Connection     │  │ Room        │  │
+│  │  Manager        │  │  (WebSocket)    │  │ Manager     │  │
 │  └─────────────────┘  └─────────────────┘  └─────────────┘  │
-│  ┌─────────────────┐                                      │
-│  │    Handler       │  ← Routes messages to appropriate     │
-│  └─────────────────┘     domain operations                   │
+│  ┌─────────────────┐                                        │
+│  │    Handler      │  ← Routes messages to appropriate      │
+│  └─────────────────┘     domain operations                  │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    Domain Layer                                 │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐            │
-│  │    Room      │  │ Participant  │  │    Track     │            │
-│  │             │  │              │  │              │            │
-│  │ - ID        │  │ - ID         │  │ - ID         │            │
-│  │ - State     │  │ - Name       │  │ - Kind       │            │
-│  │ - Participants││ - State      │  │ - Source     │            │
-│  └─────────────┘  │ - Room       │  │ - State      │            │
-│                   │ - pubTracks  │  │ - Publisher  │            │
-│                   │ - subTracks  │  └─────────────┘            │
-│                   └─────────────┘                                │
+│                    Domain Layer                             │
+│  ┌───────────────┐  ┌──────────────┐  ┌─────────────┐       │
+│  │    Room       │  │ Participant  │  │    Track    │       │
+│  │               │  │              │  │             │       │
+│  │ - ID          │  │ - ID         │  │ - ID        │       │
+│  │ - State       │  │ - Name       │  │ - Kind      │       │
+│  │ - Participants│  │ - State      │  │ - Source    │       │
+│  └───────────────┘  │ - Room       │  │ - State     │       │
+│                     │ - pubTracks  │  │ - Publisher │       │
+│                     │ - subTracks  │  └─────────────┘       │
+│                     └──────────────┘                        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -252,22 +252,39 @@ All three are STUN-free, exit 0, and finish in under 5 seconds. See
 ## Running Tests
 
 Slive includes comprehensive tests for the core domain model and signaling layer.
+All commands use a repository-local module cache (`GOMODCACHE="$PWD/.gocache/mod"`).
 
-### Run all tests
+### Run all tests (untagged, hook-free)
 ```bash
 make test
+# → GOMODCACHE="$PWD/.gocache/mod" go test ./... -race -count=1
 ```
 
-### Run tests with race detector
+### Run tests with internal hooks (gated)
 ```bash
-make test-race
+make test-internal
+# → GOMODCACHE="$PWD/.gocache/mod" go test -tags slive_internal ./... -race -count=1
+```
+
+### SDK smoke (build + examples)
+```bash
+make smoke
+# → go build ./... + go run ./examples/basic-room, publish-subscribe, health (each greps expected log lines)
+```
+
+### Update scale baseline (human-only)
+```bash
+make baseline
+# → go test -tags slive_internal ./test/scale -run TestScaleCapacity -count=1 -update-baseline
+# Only this target passes -update-baseline; CI never does (reports/ stays clean).
 ```
 
 ### Run specific package tests
 ```bash
-go test ./internal/domain/...
-go test ./internal/signaling/...
-go test ./internal/http/...
+export GOMODCACHE="$PWD/.gocache/mod"
+go test ./internal/domain/... -race -count=1
+go test ./internal/signaling/... -race -count=1
+go test -tags slive_internal ./test/scale -run TestScaleCapacity -count=1
 ```
 
 ### Code quality checks
@@ -277,6 +294,9 @@ make fmt
 
 # Run vet
 make vet
+
+# Lint (gofmt + vet as in CI)
+make lint
 
 # Full check (format, vet, test)
 make check

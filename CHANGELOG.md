@@ -18,8 +18,65 @@ releases.
 
 ## [Unreleased]
 
-Nothing staged for `0.7.1`. Open items carried into the next sprint are listed
-under each release's **Known issues**.
+### Added
+
+* **SFU config plumbing (TASK-034, sprint-08):** `SDKConfig.QueueSize` is now
+  applied to every `TrackForwarder` via `signaling.WithForwarderConfig`
+  (`ForwarderConfig{QueueSize: N}`); zero value keeps `DefaultQueueSize` (64).
+  `pkg/slive.WithForwarderConfig` is also exported for advanced `NewHandler`
+  wiring. Previously the value was normalized and recorded but forwarder queues
+  stayed at 64; that "reserved, not applied" wording is removed from
+  `pkg/slive/config.go`, `pkg/slive/doc.go` and `docs/sdk.md` §5/§7/§10.
+* **Wire error codes (TASK-034):** `internal/signaling` now emits distinct
+  codes `track_already_published`, `track_already_subscribed`,
+  `track_not_published`, `participant_already_exists`, `participant_left`,
+  `invalid_track_kind`, `invalid_track_source` (in addition to the existing
+  `room_closed`, `participant_not_found`, `track_not_found`, …); collapsed
+  `internal_error` mapping is eliminated for every client-visible domain error.
+  `pkg/slive.sentinelForErrorReply` matches codes first, with text fallback
+  retained as legacy belt-and-braces.
+* **N-1 sentinels:** `ErrClientClosed` and `ErrInvalidArgument` (`errors.New`
+  in `pkg/slive/errors.go`) now wrap the closed-client and missing-params
+  errors from `Client.JoinRoom`, `Client.SignalingURL` and `Client.Connect`,
+  so `errors.Is(err, slive.ErrClientClosed)` / `ErrInvalidArgument` hold.
+* **WebSocket origin policy (TASK-035, validation #6):** `signaling.WithAllowedOrigins([]string)`,
+  `SLIVE_WS_ALLOWED_ORIGINS` (comma-separated, `internal/config`) and
+  `SDKConfig.AllowedOrigins` (additive, wired via `pkg/slive` to `NewHandler`)
+  implement D1: no `Origin` header → allow; `Origin` host equal to request `Host` → allow;
+  exact match against allowlist → allow; else 403. Previously `connection.go:49` returned `true` unconditionally.
+* **WebSocket deadlines/keepalive (TASK-035, validation #8):** read deadline `WSReadTimeout`
+  default 60s (refreshed on pong + data), ping interval `WSPingInterval` default 30s
+  (enforced ≤ `ReadTimeout`/2), write deadline `WSWriteTimeout` default 10s.
+  `WSReadTimeout`/`WSPingInterval`/`WSWriteTimeout` configurable via env
+  `SLIVE_WS_READ_TIMEOUT` / `SLIVE_WS_PING_INTERVAL` / `SLIVE_WS_WRITE_TIMEOUT`
+  and handler options `WithWSReadTimeout` / `WithWSPingInterval` / `WithWSWriteTimeout`
+  (also re-exported as `pkg/slive.WithWS*`). Dead peer is reaped within `WSReadTimeout`;
+  healthy peer survives via ping/pong. Existing ghost-GC path unchanged.
+* **SDK lifecycle completion (TASK-036):** `Client.RoomIDs() []string` (sorted snapshot)
+  and `Client.CloseRoom(ctx, roomID) error` (canonical teardown: per-participant Leave,
+  forwarder stops, manager removal; `ErrRoomNotFound` for unknown, idempotent close
+  returns nil). `RoomManager.RoomIDs()`/`CloseRoom()` already existed in
+  `internal/signaling` (mutex-protected map ops) and `Handler.CloseRoom` now wraps them
+  with SFU cleanup (peer connections, forwarders, ghost timers).
+* **Test-hook gating (TASK-036, B-3):** exported hooks `ReapGhostForTest`, `ArmGhostForTest`,
+  `ResetMetrics`, `ResetGCReapedCount` moved to `internal/signaling/scale_export_sliveinternal.go`
+  with `//go:build slive_internal`. Unexported `reapGhost`/`armGhostTimer`/`resetMetrics`
+  remain tagless for in-package tests. `Client.Handler()` now carries `// Deprecated:` pointing to
+  `HTTPHandler`/`Connect`/`RoomIDs`/`CloseRoom`.
+
+### Changed
+
+* `docs/sdk.md` error table and §5/§7 updated to document the new codes and
+  the effective `QueueSize` knob.
+* `docs/sdk.md` §5 config table gains `AllowedOrigins` row; §8 gains
+  `WithAllowedOrigins` / `WithWSReadTimeout` / `WithWSPingInterval` / `WithWSWriteTimeout` rows.
+  Defaults keep existing tests green (in-process clients send no `Origin`).
+* `docs/sdk.md` §3 adds `RoomIDs`/`CloseRoom` (S) rows and deprecates `Handler()`; §7
+  monotonicity caveat updated to gated hooks. `VERSIONING.md` §5 adds `RoomIDs`/`CloseRoom`
+  to stable surface; §6 notes hooks gated. `pkg/slive/doc.go` stable list updated.
+
+Nothing else staged. Open items carried into the next sprint are listed under
+each release's **Known issues**.
 
 ---
 

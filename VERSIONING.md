@@ -129,7 +129,7 @@ the list mirrored by `pkg/slive/doc.go`, the table in
 
 * `Client`, `NewClient`, `DefaultSDKConfig`, `SDKConfig`, `Config`
 * `Client` methods: `JoinRoom`, `LeaveRoom`, `PublishTrack`, `SubscribeTrack`,
-  `UnsubscribeTrack`, `Snapshot`, `Close`
+  `UnsubscribeTrack`, `Snapshot`, `Close`, `RoomIDs`, `CloseRoom`
 * `Session` and its methods `PublishTrack`, `SubscribeTrack`, `Close`,
   `RoomID`, `ParticipantID`; the `Client` helpers `Connect`, `HTTPHandler`,
   `SignalingURL`
@@ -153,15 +153,14 @@ the list mirrored by `pkg/slive/doc.go`, the table in
 
 * `MetricsSnapshot` (all eleven fields **and their JSON keys**, which are the
   `GET /healthz` payload)
-* `ForwarderConfig` (`QueueSize`), `DefaultQueueSize` — **shape stable, effect
-  pending**: the names, fields and constant are contractual, but no
-  `TrackForwarder` reads a consumer-supplied queue size yet
-  (`SDKConfig.QueueSize` is normalized and recorded, not applied). Wiring the
-  knob up in a later release is therefore a MINOR, not a change of documented
-  behaviour; making it *mean something else* still would be.
+* `ForwarderConfig` (`QueueSize`), `DefaultQueueSize` — `SDKConfig.QueueSize`
+  is normalized by `NewClient` and plumbed via `WithForwarderConfig` so every
+  `TrackForwarder` uses it; wiring was a MINOR (sprint-08). Changing what the
+  knob means remains breaking.
+* `SDKConfig.AllowedOrigins` (`[]string`) — allowlist for WebSocket origin policy (sprint-08, additive).
 * `DiagnosticsSnapshoter`
 * `HandlerOption` and the option constructors `WithGCTTL`,
-  `WithMetricsSnapshot`, `WithDiagnosticsSnapshoter`
+  `WithForwarderConfig`, `WithAllowedOrigins`, `WithWSReadTimeout`, `WithWSPingInterval`, `WithWSWriteTimeout`, `WithMetricsSnapshot`, `WithDiagnosticsSnapshoter`
 
 **Errors**
 
@@ -172,7 +171,7 @@ the list mirrored by `pkg/slive/doc.go`, the table in
   `ErrTrackAlreadySubscribed`, `ErrTrackNotFound`, `ErrInvalidTrackKind`,
   `ErrInvalidTrackSource`, `ErrTrackNotPublished`, `ErrTrackNotReady`,
   `ErrPeerConnectionClosed`, `ErrNoPeerConnection`, `ErrInvalidSDP`,
-  `ErrInvalidICECandidate`, `ErrSessionClosed`
+  `ErrInvalidICECandidate`, `ErrSessionClosed`, `ErrClientClosed`, `ErrInvalidArgument`
 * sixteen of them alias an `internal/*` value and two
   (`ErrRoomNotFound`, `ErrRoomAlreadyExists`) are owned by `pkg/slive`; which
   side a name is on is part of the promise, because it decides what the
@@ -203,13 +202,12 @@ to them as expected churn:
   concurrency characteristics are still moving. `Client` methods are the
   supported way to manage rooms.
 * `Handler` (alias of `signaling.Handler`), `NewHandler`, `Client.Handler()` —
-  signalling internals; the supported entry point is `Client.Connect`. Note the
-  side effect of the alias: `Client.Handler()` returns the concrete type, whose
-  exported method set still includes `ResetMetrics`, `ResetGCReapedCount`,
-  `ArmGhostForTest` and `ReapGhostForTest`. A consumer that calls them breaks
-  the `forwarder_dropped_total` / `gc_reaped_total` monotonicity by hand, so
-  that promise holds only for code that never touches those hooks
-  (`docs/sdk.md` §7).
+  signalling internals; the supported entry point is `Client.Connect`. `Client.Handler()` is
+  deprecated (use `HTTPHandler`, `Connect`, `RoomIDs`/`CloseRoom`). Test hooks
+  `ResetMetrics`, `ResetGCReapedCount`, `ArmGhostForTest` and `ReapGhostForTest`
+  are gated behind `//go:build slive_internal` and not reachable without the tag
+  (TASK-036), so untagged consumers cannot break `forwarder_dropped_total` / `gc_reaped_total`
+  monotonicity (`docs/sdk.md` §7).
 * `PeerConnectionConfig` (alias of `webrtc.PeerConnectionConfig`) — pion-facing
   plumbing. Use `SDKConfig.STUNServers` instead.
 * Everything under `internal/` (`config`, `domain`, `http`, `logger`,

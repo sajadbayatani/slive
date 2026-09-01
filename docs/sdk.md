@@ -79,8 +79,8 @@ func NewClient(cfg SDKConfig) (*Client, error)   // S
 ```
 
 `NewClient` normalizes zero values: `GCParticipantTTL` → 60s,
-`QueueSize` → `DefaultQueueSize` (64, recorded only — see
-[§5](#5-configuration)), `Logger` → `slog.Default()`,
+`QueueSize` → `DefaultQueueSize` (64, applied to forwarders via
+`signaling.WithForwarderConfig`), `Logger` → `slog.Default()`,
 `STUNServers` → signaling default (`nil` means default; an **empty slice**
 forces STUN-free, which is what the examples and tests use). Validation is
 deliberately lenient: it never returns a non-nil error today, but the `error`
@@ -98,11 +98,13 @@ invalid configuration through it, so keep handling it.
 | `UnsubscribeTrack(ctx, roomID, participantID, trackID string) error` | **S** | Inverse of `SubscribeTrack`. |
 | `Snapshot() MetricsSnapshot` | **S** | Point-in-time copy of all counters and gauges; never holds handler locks while encoding. See [§7](#7-observability). |
 | `Close() error` | **S** | Closes open `Session`s, then the in-process signaling server, then the handler (stopping GC timers). Idempotent; safe to call concurrently with a parked `Session` round-trip; subsequent `JoinRoom`/`SignalingURL` calls fail with `"client is closed"`. |
+| `RoomIDs() []string` | **S** | Snapshot of active room IDs, sorted deterministically. |
+| `CloseRoom(ctx, roomID string) error` | **S** | Closes room via canonical teardown (per-participant Leave, forwarder stops, manager removal). `ErrRoomNotFound` for unknown rooms; idempotent close returns `nil`. |
 | `Connect(ctx, roomID, participantID string) (*Session, error)` | **S** | Opens a real WebSocket signaling session. See [§4](#4-session--signaling-client). If the `Client` is closed while the handshake is in flight, the session is torn down and the call fails with an `ErrSessionClosed`-wrapped error rather than returning a dead session. |
 | `HTTPHandler() http.Handler` | **S** | The production router (`/health`, `/healthz`, `/ws`) wired to this client's `Snapshot`. Serve it yourself or hand it to `httptest.NewServer`. |
 | `SignalingURL() (string, error)` | **S** | Lazily starts an in-process `net/http` server on a `127.0.0.1:0` listener hosting `HTTPHandler` and returns its base URL. The SDK deliberately does not link `net/http/httptest`. `Connect` calls this for you. |
 | `RoomManager() *RoomManager` | **U** | Escapes the alias for `signaling.RoomManager`. Prefer `Client` methods; the returned type is unstable, and its room misses keep the *internal* participant identity (see [§9](#9-error-sentinels)). |
-| `Handler() *Handler` | **U** | Same, for the signaling handler. Note [§7](#7-observability): the handler's exported metrics-reset hooks are reachable through it and void the monotonicity promise. |
+| `Handler() *Handler` | **U** | Same, for the signaling handler. Deprecated: use `HTTPHandler`, `Connect`, `RoomIDs` or `CloseRoom` instead. Test hooks (`ResetMetrics`, `ResetGCReapedCount`, `ArmGhostForTest`, `ReapGhostForTest`) are gated behind `//go:build slive_internal` and not reachable without the tag (see [§7](#7-observability)). |
 
 All four room-level methods (`LeaveRoom`, `PublishTrack`, `SubscribeTrack`,
 `UnsubscribeTrack`) follow the same rule: an unknown `roomID` is
@@ -152,8 +154,8 @@ implements `Unwrap`, so match the *sentinel*, never the text:
 
 | Reply | `errors.Is` target |
 | --- | --- |
-| Code `room_closed` / `room_not_found` / `participant_not_found` / `track_not_found` / `peer_connection_closed` | `ErrRoomClosed` / `ErrRoomNotFound` / `ErrParticipantNotFound` / `ErrTrackNotFound` / `ErrPeerConnectionClosed` |
-| Code `internal_error` (where `internal/signaling` collapses several domain errors) or any other code, with recognizable text | the sentinel whose `internal/domain` message the reply contains (e.g. `ErrTrackAlreadyPublished`, `ErrTrackAlreadySubscribed`, `ErrTrackNotPublished`, `ErrInvalidTrackKind`, `ErrInvalidTrackSource`, `ErrParticipantAlreadyExists`, `ErrParticipantLeft`, `ErrRoomClosed`) |
+| Code `room_closed` / `room_not_found` / `participant_not_found` / `track_not_found` / `peer_connection_closed` / `track_already_published` / `track_already_subscribed` / `track_not_published` / `participant_already_exists` / `participant_left` / `invalid_track_kind` / `invalid_track_source` | `ErrRoomClosed` / `ErrRoomNotFound` / `ErrParticipantNotFound` / `ErrTrackNotFound` / `ErrPeerConnectionClosed` / `ErrTrackAlreadyPublished` / `ErrTrackAlreadySubscribed` / `ErrTrackNotPublished` / `ErrParticipantAlreadyExists` / `ErrParticipantLeft` / `ErrInvalidTrackKind` / `ErrInvalidTrackSource` |
+| Code `internal_error` with recognizable text (legacy fallback) | the sentinel whose `internal/domain` message the reply contains |
 | Anything else | none — `Unwrap` returns `nil`, so the error matches no sentinel |
 
 An `error` frame tagged with a `request_type` belonging to a *different*
@@ -167,8 +169,9 @@ outcome.
 type SDKConfig struct {
     STUNServers      []string       // nil = signaling default; []string{} = STUN-free
     GCParticipantTTL time.Duration  // 0 = 60s default; negative disables GC
-    QueueSize        int            // <=0 = DefaultQueueSize (64); reserved, see below
+    QueueSize        int            // <=0 = DefaultQueueSize (64); applied to forwarders
     Logger           *slog.Logger   // nil = slog.Default()
+    AllowedOrigins   []string       // nil/empty = D1 only; exact Origin allowlist
 }
 
 func DefaultSDKConfig() SDKConfig   // S
@@ -179,8 +182,9 @@ type Config = SDKConfig             // S, compatibility alias; prefer SDKConfig
 | --- | --- | --- |
 | `STUNServers` | **S** | `nil` keeps the signaling default; an **empty slice** forces STUN-free ICE. |
 | `GCParticipantTTL` | **S** | Ghost-participant reconnect window. `0` → 60s, negative disables GC. |
-| `QueueSize` | **S + N** | **Reserved: recorded, not applied.** `NewClient` normalizes it (`<= 0` → `DefaultQueueSize`, 64) and keeps it on the config, but no forwarder reads it: `signaling.NewHandler` accepts no forwarder option, so every `TrackForwarder` runs with `DefaultQueueSize`. Setting it changes no behaviour until a signaling option plumbs it (sprint-08). The *shape* is stable; the *effect* is pending. |
+| `QueueSize` | **S** | `NewClient` normalizes it (`<= 0` → `DefaultQueueSize`, 64) and plumbs it to `signaling.WithForwarderConfig` so every `TrackForwarder` uses it. |
 | `Logger` | **S** | Structured lifecycle events; `nil` → `slog.Default()`. |
+| `AllowedOrigins` | **S** | Cross-origin allowlist for WebSocket `Origin`. `nil`/empty keeps D1 (no-Origin allowed, same-origin allowed, else 403); entries are matched exactly, e.g. `"https://example.com"`. Wired from `SLIVE_WS_ALLOWED_ORIGINS` (comma-separated) and `SDKConfig.AllowedOrigins` (additive). |
 
 `SDKConfig` is the stable replacement for `internal/config.Config`, which stays
 the env-var wiring for `cmd/slive`. New fields may be added in a MINOR and will
@@ -287,17 +291,15 @@ type DiagnosticsSnapshoter interface {   // S
 `Client`, `Handler` and any user type satisfy it. Implementations must return a
 copy without holding caller locks.
 
-> **Monotonicity caveat (unstable surface).** `forwarder_dropped_total` and
-> `gc_reaped_total` only count *upwards* while nothing resets them. Because
-> `Handler` is an alias of `signaling.Handler`, `Client.Handler()` hands out the
-> concrete type, whose exported method set includes the test-only
-> `ResetMetrics`, `ResetGCReapedCount`, `ArmGhostForTest` and `ReapGhostForTest`
-> hooks. Anything that calls them (including this repository's own scale tests)
-> legitimately breaks the counters, so an assertion that
-> `forwarder_dropped_total` never decreases only holds for code that never
-> touches those hooks. The `sprint-07` review recommends gating them behind a
-> build tag in sprint-08; until then this note, not the **U** tier label, is
-> what bounds the promise.
+> **Monotonicity caveat (gated test hooks).** `forwarder_dropped_total` and
+> `gc_reaped_total` only count *upwards* on stable code paths. The test-only
+> hooks `ResetMetrics`, `ResetGCReapedCount`, `ArmGhostForTest` and
+> `ReapGhostForTest` are gated behind `//go:build slive_internal` (TASK-036)
+> and are not reachable via `Client.Handler()` without that tag. `test/scale`
+> builds with `-tags slive_internal`; in-package `internal/signaling` tests
+> use the unexported `resetMetrics`/`reapGhost`/`armGhostTimer` directly.
+> An assertion that `forwarder_dropped_total` never decreases holds for all
+> untagged consumer code.
 
 ### Forwarder knobs
 
@@ -309,14 +311,11 @@ type ForwarderConfig struct {   // S (alias of webrtc.ForwarderConfig)
 const DefaultQueueSize = webrtc.DefaultQueueSize   // S, currently 64
 ```
 
-`ForwarderConfig` is exported so its tuning knob is discoverable, but **no
-`pkg/slive` function takes one**, and the matching `SDKConfig.QueueSize` field
-is [reserved](#5-configuration): `NewClient` normalizes and records the value,
-yet every `TrackForwarder` the handler builds still runs with
-`DefaultQueueSize` (64) because `signaling.NewHandler` accepts no forwarder
-option. Neither `SDKConfig.QueueSize` nor a hand-built `ForwarderConfig`
-therefore changes queue behaviour on the `0.7.0` surface; real plumbing is a
-sprint-08 item.
+`ForwarderConfig` is exported so its tuning knob is discoverable.
+`SDKConfig.QueueSize` is normalized by `NewClient` and plumbed to
+`signaling.WithForwarderConfig` so every `TrackForwarder` uses it; a
+hand-built `ForwarderConfig` can also be passed via `WithForwarderConfig` on
+`NewHandler` for advanced wiring.
 
 `PeerConnectionConfig` (alias of `webrtc.PeerConnectionConfig`) is **U** —
 pion-facing plumbing. Configure ICE with `SDKConfig.STUNServers`.
@@ -335,6 +334,11 @@ func NewHandler(rm *RoomManager, opts ...HandlerOption) *Handler   // U (signatu
 
 type HandlerOption = signaling.HandlerOption                // S
 func WithGCTTL(d time.Duration) HandlerOption               // S — ghost-participant GC TTL; 0 disables GC, default 60s
+func WithForwarderConfig(cfg ForwarderConfig) HandlerOption // S — per-subscriber RTP queue capacity; 0 → DefaultQueueSize (64)
+func WithAllowedOrigins(origins []string) HandlerOption     // S — cross-origin allowlist; D1 defaults (no-Origin + same-Origin allowed)
+func WithWSReadTimeout(d time.Duration) HandlerOption       // S — read deadline; 0 → 60s, refreshed on pong
+func WithWSPingInterval(d time.Duration) HandlerOption      // S — ping interval; 0 → 30s, enforced ≤ ReadTimeout/2
+func WithWSWriteTimeout(d time.Duration) HandlerOption      // S — write deadline; 0 → 10s
 func WithMetricsSnapshot(fn func() MetricsSnapshot) HandlerOption        // S + N
 func WithDiagnosticsSnapshoter(s DiagnosticsSnapshoter) HandlerOption    // S + N
 ```
@@ -368,18 +372,20 @@ current texts are `"room not found"` and `"room already exists"`.
 | `ErrParticipantAlreadyExists` | Participant ID already in the room. | `Room.Join` (never from `Client.JoinRoom`, which treats it as the idempotent success); `RoomManager.CreateRoom` reports this internal value for a *room* collision. |
 | `ErrParticipantNotFound` | Participant not in the room. | The four room-level `Client` methods above with an unknown `participantID`; `RoomManager.CloseRoom` for an unknown room (internal identity). |
 | `ErrParticipantLeft` | Operation targets a participant that has left. | `Participant` / `Room` aliases, e.g. subscribing after `Participant.Leave`. |
-| `ErrTrackAlreadyPublished` | Same participant re-publishes a `trackID`. | `Client.PublishTrack`; a `Session.PublishTrack` reply (mapped from the message text). |
-| `ErrTrackAlreadySubscribed` | Duplicate subscription. | `Client.SubscribeTrack`; a `Session.SubscribeTrack` reply. |
+| `ErrTrackAlreadyPublished` | Same participant re-publishes a `trackID`. | `Client.PublishTrack`; a `Session.PublishTrack` reply (`track_already_published`). |
+| `ErrTrackAlreadySubscribed` | Duplicate subscription. | `Client.SubscribeTrack`; a `Session.SubscribeTrack` reply (`track_already_subscribed`). |
 | `ErrTrackNotFound` | Track not registered in the room. | `Client.SubscribeTrack` / `Client.UnsubscribeTrack`; a `Session` reply carrying the `track_not_found` code. |
-| `ErrInvalidTrackKind` | `TrackKind` is neither `TrackKindAudio` nor `TrackKindVideo`. Note `TrackKindAudio` is the iota value `0`, so the zero value means audio — it is not an "unset" marker. | `Client.PublishTrack`, `Session.PublishTrack`. |
-| `ErrInvalidTrackSource` | `TrackSource` is not a known source. | `Client.PublishTrack`, `Session.PublishTrack`. |
-| `ErrTrackNotPublished` | Operation needs a published track. | `Track.AddSubscriber` through the `Room`/`Participant` aliases; a `Session` reply carrying the text. |
+| `ErrInvalidTrackKind` | `TrackKind` is neither `TrackKindAudio` nor `TrackKindVideo`. Note `TrackKindAudio` is the iota value `0`, so the zero value means audio — it is not an "unset" marker. | `Client.PublishTrack`, `Session.PublishTrack` (`invalid_track_kind`). |
+| `ErrInvalidTrackSource` | `TrackSource` is not a known source. | `Client.PublishTrack`, `Session.PublishTrack` (`invalid_track_source`). |
+| `ErrTrackNotPublished` | Operation needs a published track. | `Track.AddSubscriber` through the `Room`/`Participant` aliases; a `Session` reply (`track_not_published`). |
 | `ErrTrackNotReady` | Track not ready for media operations. | `internal/webrtc` only — no stable `pkg/slive` symbol returns it. |
 | `ErrPeerConnectionClosed` | Target peer connection is closed. | A `Session` round-trip whose reply carries the `peer_connection_closed` code; media paths otherwise. |
 | `ErrNoPeerConnection` | No peer connection available. | `internal/webrtc` only — no stable `pkg/slive` symbol returns it. |
 | `ErrInvalidSDP` | SDP string failed to parse. | `internal/webrtc` only (raw signaling), never surfaced by `Client` or `Session`. |
 | `ErrInvalidICECandidate` | ICE candidate string failed to parse. | `internal/webrtc` only (raw signaling), never surfaced by `Client` or `Session`. |
 | `ErrSessionClosed` | A `Session` method runs after teardown, or the transport was dropped because the peer mis-correlated a reply. | `Client.Connect` (rejected mid-handshake), `Session` methods, `Session.Close` callers. |
+| `ErrClientClosed` | An operation targets a closed `Client`. | `Client.JoinRoom`, `Client.SignalingURL`, `Client.Connect` via `SignalingURL`. |
+| `ErrInvalidArgument` | Required `roomID`/`participantID` missing. | `Client.JoinRoom`, `Client.Connect`. |
 
 > **DEF-01 — fixed in `0.7.0`.** `ErrRoomNotFound` and `ErrRoomAlreadyExists`
 > used to be `var` aliases of `domain.ErrParticipantNotFound` and
@@ -404,20 +410,18 @@ current texts are `"room not found"` and `"room already exists"`.
 > frozen-but-never-returned sentinel.
 
 Adding a sentinel is a MINOR; removing or rebinding one is breaking.
-`Client` methods that report "closed" today (`JoinRoom`, `SignalingURL` after
-`Close`) return an unexported `fmt.Errorf` value, not a sentinel — do not match
-on it; that is why `Close`-state checks are `err != nil` only.
+`Client` methods that report "closed" (`JoinRoom`, `SignalingURL` after `Close`)
+now return `ErrClientClosed`, and missing `roomID`/`participantID` returns
+`ErrInvalidArgument`; match them with `errors.Is`.
 
 ---
 
 ## 10. Known gaps and intentional deferrals
 
-* **`SDKConfig.QueueSize` and `ForwarderConfig` are inert.** Both are frozen
-  shapes with no effect: the value is normalized and recorded, every
-  `TrackForwarder` still runs with `DefaultQueueSize`, and `signaling.NewHandler`
-  has no forwarder option to receive it. Treat a queue-size change as a no-op
-  until sprint-08 plumbs it (see [§5](#5-configuration),
-  [§7](#7-observability)).
+* **`SDKConfig.QueueSize` / `ForwarderConfig` plumbing is complete.** `NewClient`
+  normalizes `QueueSize` and passes it via `signaling.WithForwarderConfig`; the
+  previous "recorded, not applied" note is obsolete as of sprint-08. Remains:
+  bounded-drop semantics (TASK-022) unchanged.
 * **No RTP injection from the SDK (intentional).** The `TrackForwarder` type
   and its `WriteRTP` method are not exported on the `0.7.0` surface, so no
   `pkg/slive` symbol can push a synthetic RTP burst. TASK-032's brief asked for
@@ -456,10 +460,17 @@ and finish in under 5 seconds. See also
 ```bash
 export GOMODCACHE="$PWD/.gocache/mod"
 go doc -all ./pkg/slive                      # every pinned symbol exists and is documented
-go test ./test/sdk/... -race -count=1        # surface + error-contract + example + README gates
-go vet ./pkg/slive/... ./examples/...        # stdlib vet checks over the public surface
-gofmt -l pkg/slive examples test/sdk         # must print nothing
+go vet ./...                                 # stdlib vet checks (CI lint job)
+gofmt -l .                                   # must print nothing (CI lint job)
+go test ./... -race -count=1                 # untagged, hook-free (CI test job; test/scale uses temp baseline)
+go test -tags slive_internal ./... -race -count=1  # gated hooks (CI test job)
+go build ./...                               # CI sdk-smoke job
+go run ./examples/basic-room                 # → grep "basic-room: exit 0" + "rooms_active:"
+go run ./examples/publish-subscribe          # → grep "publish-subscribe: exit 0" + "forwarder_subscribers:"
+go run ./examples/health                     # → grep "health: exit 0" + "status=ok"
 ```
+
+Shortcuts (same commands with caching): `make lint` (gofmt+vet), `make test`, `make test-internal`, `make smoke`. `make baseline` is the only human-run path that passes `-update-baseline` to rewrite `reports/scale-baseline.md`; CI asserts `git status --porcelain reports/` empty (`.github/workflows/ci.yml` lint/test/sdk-smoke matrix, `GOMODCACHE="$PWD/.gocache/mod"` cache at `.gocache/mod`).
 
 `test/sdk` is a normal package inside this module (it does not have its own
 `go.mod`) and shells out to the same commands above, so a rename that would

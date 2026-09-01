@@ -6,10 +6,12 @@ on:
       - main
   pull_request:
 
-jobs:
-  test:
-    runs-on: ubuntu-latest
+env:
+  GOMODCACHE: ${{ github.workspace }}/.gocache/mod
 
+jobs:
+  lint:
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,15 +21,98 @@ jobs:
         with:
           go-version: "1.24"
 
-      - name: Format check
-        run: |
-          test -z "$(gofmt -l .)"
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: .gocache/mod
+          key: ${{ runner.os }}-go-1.24-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-1.24-
+            ${{ runner.os }}-go-
+
+      - name: Format check (gofmt)
+        run: test -z "$(gofmt -l . 2>&1 | grep -v '^\.gocache/' | grep -v '^\.qwen/')"
 
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test ./...
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Race detector
-        run: go test -race ./...
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: .gocache/mod
+          key: ${{ runner.os }}-go-1.24-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-1.24-
+            ${{ runner.os }}-go-
+
+      - name: Test (untagged, hook-free)
+        run: go test ./... -race -count=1
+
+      - name: Test (slive_internal)
+        run: go test -tags slive_internal ./... -race -count=1
+
+      - name: Assert no baseline churn
+        run: test -z "$(git status --porcelain reports/)"
+
+  sdk-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: .gocache/mod
+          key: ${{ runner.os }}-go-1.24-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-1.24-
+            ${{ runner.os }}-go-
+
+      - name: Build all packages
+        run: go build ./...
+
+      - name: Smoke basic-room
+        run: |
+          set -e
+          go run ./examples/basic-room 2>&1 | tee /tmp/basic-room.log
+          grep -q "room joined:" /tmp/basic-room.log
+          grep -q "rooms_active:" /tmp/basic-room.log
+          grep -q "basic-room: exit 0" /tmp/basic-room.log
+
+      - name: Smoke publish-subscribe
+        run: |
+          set -e
+          go run ./examples/publish-subscribe 2>&1 | tee /tmp/publish-subscribe.log
+          grep -q "room joined:" /tmp/publish-subscribe.log
+          grep -q "track published" /tmp/publish-subscribe.log
+          grep -q "track subscribed" /tmp/publish-subscribe.log
+          grep -q "forwarder_subscribers:" /tmp/publish-subscribe.log
+          grep -q "publish-subscribe: exit 0" /tmp/publish-subscribe.log
+
+      - name: Smoke health
+        run: |
+          set -e
+          go run ./examples/health 2>&1 | tee /tmp/health.log
+          grep -q "room joined:" /tmp/health.log
+          grep -q "status=ok" /tmp/health.log
+          grep -q "health: exit 0" /tmp/health.log
+
+      - name: Assert no baseline churn
+        run: test -z "$(git status --porcelain reports/)"
