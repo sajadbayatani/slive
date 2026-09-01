@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -14,7 +16,20 @@ import (
 	webrtc "github.com/sajadbayatani/slive/internal/webrtc"
 )
 
+var (
+	version = "dev"
+	commit  = "unknown"
+	date    = "unknown"
+)
+
 func main() {
+	showVersion := flag.Bool("version", false, "print version and exit")
+	flag.Parse()
+	if *showVersion {
+		fmt.Printf("slive %s (commit %s, built %s)\n", version, commit, date)
+		os.Exit(0)
+	}
+
 	cfg := config.Load()
 
 	log := logger.New()

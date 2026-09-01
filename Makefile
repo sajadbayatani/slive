@@ -2,7 +2,12 @@ APP_NAME := slive
 GOMODCACHE ?= $(PWD)/.gocache/mod
 export GOMODCACHE
 
-.PHONY: test test-internal smoke baseline lint vet fmt build check clean docker-build docker-run
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)
+
+.PHONY: test test-internal smoke baseline lint vet fmt build check clean docker-build docker-buildx docker-run version dist cover cover-html
 
 test:
 	GOMODCACHE="$(PWD)/.gocache/mod" go test ./... -race -count=1
@@ -29,7 +34,35 @@ fmt:
 	go fmt ./...
 
 build:
-	GOMODCACHE="$(PWD)/.gocache/mod" go build -o bin/$(APP_NAME) ./cmd/slive
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$(APP_NAME) ./cmd/slive
+
+version:
+	@echo $(VERSION)
+
+dist:
+	rm -rf dist
+	mkdir -p dist
+	for GOOS in linux darwin; do \
+	  for GOARCH in amd64 arm64; do \
+	    echo "Building slive_$${GOOS}_$${GOARCH}..."; \
+	    CGO_ENABLED=0 GOOS=$${GOOS} GOARCH=$${GOARCH} go build -trimpath -ldflags "$(LDFLAGS)" -o dist/slive_$${GOOS}_$${GOARCH}/slive ./cmd/slive; \
+	    cp README.md LICENSE dist/slive_$${GOOS}_$${GOARCH}/; \
+	    tar -czf dist/slive_$(VERSION)_$${GOOS}_$${GOARCH}.tar.gz -C dist/slive_$${GOOS}_$${GOARCH} slive README.md LICENSE; \
+	    rm -rf dist/slive_$${GOOS}_$${GOARCH}; \
+	  done; \
+	done
+	if command -v sha256sum >/dev/null 2>&1; then \
+	  sha256sum dist/*.tar.gz > dist/checksums.txt; \
+	else \
+	  shasum -a 256 dist/*.tar.gz > dist/checksums.txt; \
+	fi
+	cat dist/checksums.txt
+
+cover:
+	go test ./... -coverprofile=coverage.out && go tool cover -func=coverage.out
+
+cover-html:
+	go tool cover -html=coverage.out -o coverage.html
 
 check:
 	go fmt ./...
@@ -41,6 +74,9 @@ clean:
 
 docker-build:
 	docker build -t $(APP_NAME):local .
+
+docker-buildx:
+	docker buildx build --platform linux/amd64,linux/arm64 --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) -t $(APP_NAME):$(VERSION) .
 
 docker-run:
 	docker run --rm -p 8080:8080 $(APP_NAME):local
