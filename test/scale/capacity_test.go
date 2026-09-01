@@ -2,6 +2,7 @@ package scale
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/sajadbayatani/slive/internal/domain"
 )
+
+var updateBaseline = flag.Bool("update-baseline", false, "write reports/scale-baseline.md (default writes to TempDir and asserts keys only)")
 
 func TestScaleCapacity(t *testing.T) {
 	profile := DefaultScaleProfile()
@@ -170,11 +173,19 @@ func TestScaleCapacity(t *testing.T) {
 	}
 
 	_ = snapBefore
-	reportsPath := filepath.Join("..", "..", "reports", "scale-baseline.md")
-	if _, err := os.Stat(filepath.Dir(reportsPath)); err == nil {
-		content := fmt.Sprintf("# Scale Baseline\n\nDate: %s\n\nProfile: %d rooms x %d participants (%d publishers, %d subs), %d subs/track, %d pkt/forwarder\n\n```json\n%s\n```\n\n- goroutines before: %d after: %d allowance: %d\n- forwarder_dropped_total: %d\n- gc_reaped_total: %d\n- rooms_active: %d\n- duration_ms: %d uptime_seconds: %d\n",
-			time.Now().Format(time.RFC3339), profile.Rooms, profile.ParticipantsPerRoom, profile.PublishersPerRoom, profile.SubscribersPerRoom, profile.SubsPerTrack, profile.PacketsPerForwarder, string(j), goroutinesBefore, goroutinesAfter, allowance, snapAfter.ForwarderDroppedTotal, snapAfter.GCReapedTotal, snapAfter.RoomsActive, durationMs, snapAfter.UptimeSeconds)
-		_ = os.WriteFile(reportsPath, []byte(content), 0644)
-		t.Logf("wrote %s", reportsPath)
+	// Baseline flag gate: default writes to TempDir and asserts keys only;
+	// with -update-baseline writes to reports/scale-baseline.md.
+	content := fmt.Sprintf("# Scale Baseline\n\nDate: %s\n\nProfile: %d rooms x %d participants (%d publishers, %d subs), %d subs/track, %d pkt/forwarder\n\n```json\n%s\n```\n\n- goroutines before: %d after: %d allowance: %d\n- forwarder_dropped_total: %d\n- gc_reaped_total: %d\n- rooms_active: %d\n- duration_ms: %d uptime_seconds: %d\n",
+		time.Now().Format(time.RFC3339), profile.Rooms, profile.ParticipantsPerRoom, profile.PublishersPerRoom, profile.SubscribersPerRoom, profile.SubsPerTrack, profile.PacketsPerForwarder, string(j), goroutinesBefore, goroutinesAfter, allowance, snapAfter.ForwarderDroppedTotal, snapAfter.GCReapedTotal, snapAfter.RoomsActive, durationMs, snapAfter.UptimeSeconds)
+	if *updateBaseline {
+		reportsPath := filepath.Join("..", "..", "reports", "scale-baseline.md")
+		if _, err := os.Stat(filepath.Dir(reportsPath)); err == nil {
+			_ = os.WriteFile(reportsPath, []byte(content), 0644)
+			t.Logf("wrote %s (update-baseline)", reportsPath)
+		}
+	} else {
+		tmpPath := filepath.Join(t.TempDir(), "scale-baseline.md")
+		_ = os.WriteFile(tmpPath, []byte(content), 0644)
+		t.Logf("baseline written to temp %s (use -update-baseline to write reports/)", tmpPath)
 	}
 }
