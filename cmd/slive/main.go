@@ -68,6 +68,10 @@ func newSignalingHandler(cfg config.Config, log *logger.Logger) *signaling.Handl
 		signaling.WithPeerConnectionConfig(buildPeerConnectionConfig(cfg)),
 		signaling.WithLogger(log.Logger),
 		signaling.WithGCTTL(cfg.GCParticipantTTL),
+		signaling.WithAllowedOrigins(cfg.WSAllowedOrigins),
+		signaling.WithWSReadTimeout(cfg.WSReadTimeout),
+		signaling.WithWSPingInterval(cfg.WSPingInterval),
+		signaling.WithWSWriteTimeout(cfg.WSWriteTimeout),
 	)
 }
 

@@ -14,6 +14,10 @@ type Config struct {
 	STUNServers      []string
 	TURNServers      []TURNServer
 	GCParticipantTTL time.Duration
+	WSAllowedOrigins []string
+	WSReadTimeout    time.Duration
+	WSPingInterval   time.Duration
+	WSWriteTimeout   time.Duration
 }
 
 // TURNServer describes one TURN endpoint and its optional credentials.
@@ -29,6 +33,9 @@ const (
 	DefaultHealthPath       = "/health"
 	DefaultWebSocketPath    = "/ws"
 	DefaultGCParticipantTTL = 60 * time.Second
+	DefaultWSReadTimeout    = 60 * time.Second
+	DefaultWSPingInterval   = 30 * time.Second
+	DefaultWSWriteTimeout   = 10 * time.Second
 )
 
 // Load reads runtime configuration. Comma-separated STUN_SERVERS and
@@ -41,6 +48,14 @@ func Load() Config {
 		WebSocketPath:    envOrDefault("WEBSOCKET_PATH", DefaultWebSocketPath),
 		STUNServers:      splitServerURLs(os.Getenv("STUN_SERVERS")),
 		GCParticipantTTL: parseDurationOrDefault(os.Getenv("SLIVE_GC_TTL"), DefaultGCParticipantTTL),
+		WSAllowedOrigins: splitAllowedOrigins(os.Getenv("SLIVE_WS_ALLOWED_ORIGINS")),
+		WSReadTimeout:    parseDurationOrDefault(os.Getenv("SLIVE_WS_READ_TIMEOUT"), DefaultWSReadTimeout),
+		WSPingInterval:   parseDurationOrDefault(os.Getenv("SLIVE_WS_PING_INTERVAL"), DefaultWSPingInterval),
+		WSWriteTimeout:   parseDurationOrDefault(os.Getenv("SLIVE_WS_WRITE_TIMEOUT"), DefaultWSWriteTimeout),
+	}
+
+	if cfg.WSPingInterval > cfg.WSReadTimeout/2 {
+		cfg.WSPingInterval = cfg.WSReadTimeout / 2
 	}
 
 	if turnURLs := splitServerURLs(os.Getenv("TURN_SERVERS")); len(turnURLs) > 0 {
@@ -81,4 +96,14 @@ func parseDurationOrDefault(value string, fallback time.Duration) time.Duration 
 		return d
 	}
 	return fallback
+}
+
+func splitAllowedOrigins(value string) []string {
+	var out []string
+	for _, v := range strings.Split(value, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }

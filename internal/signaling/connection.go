@@ -4,10 +4,18 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+// Default WebSocket timeouts.
+const (
+	DefaultWSReadTimeout  = 60 * time.Second
+	DefaultWSPingInterval = 30 * time.Second
+	DefaultWSWriteTimeout = 10 * time.Second
 )
 
 // ConnectionState represents the state of a WebSocket connection.
@@ -34,21 +42,61 @@ type Connection struct {
 	// logger is resolved at construction (nil becomes slog.Default()) and
 	// immutable afterwards; the read/write loops use it without locking.
 	logger *slog.Logger
+
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+	pingInterval time.Duration
+}
+
+// isOriginAllowed implements D1: no-Origin → allow; Origin host equal to
+// request Host → allow; exact match against allowlist → allow; else reject.
+func isOriginAllowed(r *http.Request, allowedOrigins []string) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	for _, a := range allowedOrigins {
+		if a == origin {
+			return true
+		}
+	}
+	if u, err := url.Parse(origin); err == nil {
+		if u.Host == r.Host {
+			return true
+		}
+	}
+	return false
 }
 
 // NewConnection creates a new Connection from an HTTP request. A nil logger
-// resolves to slog.Default().
+// resolves to slog.Default(). It uses default timeouts and no origin allowlist.
 func NewConnection(logger *slog.Logger, w http.ResponseWriter, r *http.Request, roomID, participantID string) (*Connection, error) {
+	return NewConnectionWithConfig(logger, w, r, roomID, participantID, nil, DefaultWSReadTimeout, DefaultWSPingInterval, DefaultWSWriteTimeout)
+}
+
+// NewConnectionWithConfig creates a Connection with explicit origin and timeout config.
+func NewConnectionWithConfig(logger *slog.Logger, w http.ResponseWriter, r *http.Request, roomID, participantID string, allowedOrigins []string, readTimeout, pingInterval, writeTimeout time.Duration) (*Connection, error) {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if readTimeout <= 0 {
+		readTimeout = DefaultWSReadTimeout
+	}
+	if writeTimeout <= 0 {
+		writeTimeout = DefaultWSWriteTimeout
+	}
+	if pingInterval <= 0 {
+		pingInterval = DefaultWSPingInterval
+	}
+	if pingInterval > readTimeout/2 {
+		pingInterval = readTimeout / 2
 	}
 
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
 		CheckOrigin: func(r *http.Request) bool {
-			// TODO: Add proper origin checking
-			return true
+			return isOriginAllowed(r, allowedOrigins)
 		},
 	}
 
@@ -56,6 +104,18 @@ func NewConnection(logger *slog.Logger, w http.ResponseWriter, r *http.Request, 
 	if err != nil {
 		return nil, err
 	}
+
+	// Configure deadlines and handlers.
+	_ = wsConn.SetReadDeadline(time.Now().Add(readTimeout))
+	wsConn.SetPongHandler(func(string) error {
+		_ = wsConn.SetReadDeadline(time.Now().Add(readTimeout))
+		return nil
+	})
+	wsConn.SetPingHandler(func(appData string) error {
+		_ = wsConn.SetReadDeadline(time.Now().Add(readTimeout))
+		_ = wsConn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		return wsConn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(writeTimeout))
+	})
 
 	conn := &Connection{
 		wsConn:        wsConn,
@@ -67,6 +127,9 @@ func NewConnection(logger *slog.Logger, w http.ResponseWriter, r *http.Request, 
 		receiveChan:   make(chan []byte, 256),
 		closeChan:     make(chan struct{}),
 		logger:        logger,
+		readTimeout:   readTimeout,
+		writeTimeout:  writeTimeout,
+		pingInterval:  pingInterval,
 	}
 
 	// Start read and write goroutines
@@ -186,6 +249,8 @@ func (c *Connection) readLoop() {
 				c.Close()
 				return
 			}
+			// Refresh deadline after successful read so idle timeout only fires when no messages at all.
+			_ = c.wsConn.SetReadDeadline(time.Now().Add(c.readTimeout))
 
 			select {
 			case c.receiveChan <- data:
@@ -200,9 +265,13 @@ func (c *Connection) readLoop() {
 func (c *Connection) writeLoop() {
 	defer c.Close()
 
+	ticker := time.NewTicker(c.pingInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case data := <-c.sendChan:
+			_ = c.wsConn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 			if err := c.wsConn.WriteMessage(websocket.TextMessage, data); err != nil {
 				if !websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 					c.logger.Warn("websocket write failed",
@@ -212,6 +281,17 @@ func (c *Connection) writeLoop() {
 						"error", err,
 					)
 				}
+				return
+			}
+		case <-ticker.C:
+			_ = c.wsConn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+			if err := c.wsConn.WriteControl(websocket.PingMessage, nil, time.Now().Add(c.writeTimeout)); err != nil {
+				c.logger.Warn("websocket ping failed",
+					"event", "ws_ping_failed",
+					"participant_id", c.participantID,
+					"room_id", c.roomID,
+					"error", err,
+				)
 				return
 			}
 		case <-c.closeChan:
