@@ -73,9 +73,11 @@ func (h *Handler) Snapshot() webrtc.MetricsSnapshot {
 	return snap
 }
 
-// Reset resets test-visible counters: connection metrics and GC reaped count,
-// and per-forwarder dropped totals.
-func (h *Handler) ResetMetrics() {
+// resetMetrics resets test-visible counters: connection metrics and GC reaped count,
+// and per-forwarder dropped totals. It is the unexported implementation used by
+// in-package tests; the exported ResetMetrics wrapper is gated behind
+// //go:build slive_internal.
+func (h *Handler) resetMetrics() {
 	webrtc.ConnectionMetrics.Reset()
 	atomic.StoreUint64(&h.gcReapedCount, 0)
 	h.trackForwardersMutex.RLock()
@@ -85,7 +87,9 @@ func (h *Handler) ResetMetrics() {
 	h.trackForwardersMutex.RUnlock()
 }
 
-// ResetGCReapedCount clears the ghost-reap counter. Intended for tests.
-func (h *Handler) ResetGCReapedCount() {
+// resetGCReapedCount clears the ghost-reap counter. It is the unexported
+// implementation; the exported ResetGCReapedCount wrapper is gated behind
+// //go:build slive_internal.
+func (h *Handler) resetGCReapedCount() {
 	atomic.StoreUint64(&h.gcReapedCount, 0)
 }
