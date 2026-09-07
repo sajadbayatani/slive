@@ -19,8 +19,7 @@
 .env.*
 !.env.example
 
-# Qwen local/runtime files
-.qwen
+# local/runtime files
 agents/
 tasks/
 state/
@@ -28,7 +27,6 @@ skills/
 roadmap/
 reports/
 docs/AGENT*
-.qoder
 
 # OS
 .DS_Store
@@ -38,6 +36,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+AGENTS.md
 
 # Logs
 *.log
