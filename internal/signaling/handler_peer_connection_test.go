@@ -23,6 +23,34 @@ func newTestHandler() *Handler {
 	return NewHandler(NewRoomManager(), WithPeerConnectionConfig(newTestPeerConnectionConfig()))
 }
 
+// driveSubscriberOffer runs the exact subscriber-side geometry the handler
+// uses for a subscription (AddTrack followed by the sync-driven subscriber
+// offer), so tests observe a real offer instead of relying on
+// AddTransceiverFromKind, whose no-change trigger the negotiation generation
+// guard now skips by design.
+func driveSubscriberOffer(t *testing.T, pc *webrtc.PeerConnection, trackID string) {
+	t.Helper()
+	dt, err := domain.NewTrack(trackID, domain.TrackKindAudio, domain.TrackSourceMicrophone)
+	if err != nil {
+		t.Fatalf("domain.NewTrack: %v", err)
+	}
+	lt, err := pionwebrtc.NewTrackLocalStaticRTP(
+		pionwebrtc.RTPCodecCapability{MimeType: pionwebrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+		trackID, trackID+"-stream",
+	)
+	if err != nil {
+		t.Fatalf("NewTrackLocalStaticRTP: %v", err)
+	}
+	track := webrtc.NewWebRTCTrack(dt, lt, pionwebrtc.RTPCodecParameters{
+		RTPCodecCapability: pionwebrtc.RTPCodecCapability{MimeType: pionwebrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+		PayloadType:        111,
+	})
+	if err := pc.AddTrack(track); err != nil {
+		t.Fatalf("AddTrack: %v", err)
+	}
+	pc.RequestSubscriberOffer()
+}
+
 // joinParticipant creates and joins a participant in a room owned by the
 // handler's room manager, mirroring the join branch of handleConnection.
 func joinParticipant(t *testing.T, h *Handler, roomID, participantID string) (*domain.Room, *domain.Participant) {
@@ -83,14 +111,12 @@ func TestEnsurePeerConnectionCreatesAndReuses(t *testing.T) {
 		t.Fatal("expected the existing peer connection instance to be reused")
 	}
 
-	// Prove the swap took effect: adding a transceiver fires
-	// negotiation-needed, which pushes an offer plus its gathered ICE
-	// candidates through the most recent sender. Candidates arrive while
-	// gathering runs, so drain until the offer itself shows up.
+	// Prove the swap took effect: a real subscription (AddTrack + the sync
+	// drive, as the handler performs on subscribe) pushes an offer plus its
+	// gathered ICE candidates through the most recent sender. Candidates
+	// arrive while gathering runs, so drain until the offer itself shows up.
 	// STUN-free config keeps everything offline and deterministic.
-	if _, err := pc2.PionPeerConnection().AddTransceiverFromKind(pionwebrtc.RTPCodecTypeAudio); err != nil {
-		t.Fatalf("AddTransceiverFromKind: %v", err)
-	}
+	driveSubscriberOffer(t, pc2, "swap-audio")
 
 	gotOffer := false
 	deadline := time.After(5 * time.Second)

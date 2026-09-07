@@ -103,10 +103,25 @@ The `data` field contains the message-specific payload as JSON.
         "name": "Existing Participant"
       }
     ],
+    "tracks": [
+      {
+        "participant_id": "participant-1",
+        "track": {
+          "id": "video-participant-1",
+          "kind": "video",
+          "source": "camera"
+        }
+      }
+    ],
     "status": "success"
   }
 }
 ```
+
+`tracks` lists tracks already published by other participants at join time
+(the joiner's own tracks are excluded). A late joiner subscribes to these
+exactly as for live `track_available` notifications, which it missed by
+joining later. Empty when nothing is published yet.
 
 **Broadcast (Server → All Participants)**:
 ```json

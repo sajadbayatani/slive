@@ -15,16 +15,37 @@ var (
 // AddICECandidateWithRetry adds a remote ICE candidate, retrying transient
 // failures a bounded number of times before giving up.
 //
-// Exhausted retries are reported as ErrICEFailed wrapping the last underlying
-// error, so callers (and the signaling error mapping) can distinguish "the
-// candidate was never applied" from one-shot failures such as
-// ErrPeerConnectionClosed. SDP operations are deliberately never retried;
-// see the package documentation for that decision.
+// LiveKit-style trickle ICE: candidates received before the remote description
+// is set are queued (logged as "queueing ICE candidate") and flushed after
+// SetRemoteDescription moves to stable. This prevents the
+// "ICE candidate before remote description" race from failing.
 func (pc *PeerConnection) AddICECandidateWithRetry(candidate *ICECandidate) error {
 	logger := pc.logger
 	participantID := ""
 	if p := pc.Participant(); p != nil {
 		participantID = p.ID()
+	}
+
+	// Queue if remote description not yet set and not closed (LiveKit trickle-ICE).
+	pc.mu.RLock()
+	remoteDesc := pc.pionPC.RemoteDescription()
+	isClosed := pc.state == PeerConnectionStateClosed || pc.state == PeerConnectionStateFailed
+	pc.mu.RUnlock()
+	if !isClosed && remoteDesc == nil {
+		pc.mu.Lock()
+		// Re-check under write lock to avoid race
+		if pc.state != PeerConnectionStateClosed && pc.state != PeerConnectionStateFailed && pc.pionPC.RemoteDescription() == nil {
+			pc.pendingICECandidates = append(pc.pendingICECandidates, candidate)
+			pending := len(pc.pendingICECandidates)
+			pc.mu.Unlock()
+			logger.Info("queueing ICE candidate",
+				"event", "ice_candidate_queued",
+				"participant_id", participantID,
+				"pending", pending,
+			)
+			return nil
+		}
+		pc.mu.Unlock()
 	}
 
 	var lastErr error

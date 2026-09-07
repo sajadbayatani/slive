@@ -63,6 +63,8 @@ type subscriberEntry struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	done         chan struct{}
+	// parent feeds the forwarder-level packetsWritten counter.
+	parent *TrackForwarder
 }
 
 func (e *subscriberEntry) runWriter() {
@@ -75,6 +77,9 @@ func (e *subscriberEntry) runWriter() {
 				select {
 				case pkt := <-e.queue:
 					_ = e.pionTrack.WriteRTP(pkt)
+					if e.parent != nil {
+						e.parent.packetsWritten.Add(1)
+					}
 					// Recycle Packet struct; payload slice is GC'd.
 					*pkt = rtp.Packet{}
 					packetPool.Put(pkt)
@@ -84,6 +89,10 @@ func (e *subscriberEntry) runWriter() {
 			}
 		case pkt := <-e.queue:
 			_ = e.pionTrack.WriteRTP(pkt)
+			if e.parent != nil {
+				e.parent.packetsWritten.Add(1)
+			}
+			// Recycle Packet struct; payload slice is GC'd.
 			*pkt = rtp.Packet{}
 			packetPool.Put(pkt)
 		}
@@ -138,6 +147,20 @@ type TrackForwarder struct {
 	lifecycleMu sync.Mutex
 	queueSize   int
 	lastDropLog atomic.Int64
+	// Packet-level media counters, incremented with atomics.
+	packetsReceived  atomic.Uint64 // RTP packets read from publisher (run loop)
+	packetsForwarded atomic.Uint64 // RTP packets enqueued to >=1 subscriber (WriteRTP)
+	packetsWritten   atomic.Uint64 // RTP packets written to subscriber transports (runWriter)
+	packetsDropped   atomic.Uint64 // queue-full drops across all subscribers (mirror of per-entry droppedCount)
+	bytesReceived    atomic.Uint64 // RTP payload+header bytes read from publisher
+	lastSeq          atomic.Uint64
+	lastTimestamp    atomic.Uint64
+	lastSSRC         atomic.Uint64
+	lastPayloadType  atomic.Uint64
+	// FIR sequence-number space for this track. Each relayed FIR carries an
+	// entry SequenceNumber from this counter so the publisher can dedupe;
+	// shared by all subscribers of the track.
+	firSeq atomic.Uint32
 }
 
 // NewTrackForwarder creates a forwarder for the given publisher track.
@@ -171,11 +194,23 @@ func (f *TrackForwarder) PublisherTrack() *WebRTCTrack {
 
 // UpdatePublisher swaps the publisher track and restarts the forwarding
 // goroutine if the forwarder is running. It is used to replace a
-// placeholder TrackLocal publisher (created eagerly in handlePublishTrack)
-// with the real TrackRemote that arrives later via PeerConnection.OnTrack.
-// The forwarder keeps its existing subscribers across the swap.
+// placeholder TrackLocal publisher (created eagerly in handlePublishTrack,
+// codec unknown) with the real TrackRemote that arrives later via
+// PeerConnection.OnTrack. The forwarder keeps its existing subscribers
+// across the swap.
+//
+// Codec reconciliation: subscribers attached before the real codec arrived
+// built their egress TrackLocal from a provisional inference. When the
+// authoritative codec arrives (IsRemote), every subscriber whose egress MIME
+// mismatches is rebuilt from the real codec (remove stale sender/TrackLocal,
+// add fresh TrackLocal, existing negotiation-needed flow renegotiates).
+// Pion cannot safely re-codec a bound TrackLocal, hence rebuild. The run
+// loop restarts only after reconciliation so post-swap packets never sit in
+// stale-codec queues.
 //
 // Lock ordering: lifecycleMu > mu (Handler.trackForwardersMutex > lifecycleMu > mu).
+// PC calls and writer shutdown happen outside f.mu; reconcileSubscriber
+// takes only brief f.mu sections for map updates.
 // Dual modes: TrackLocal → TrackRemote transitions running false→true and
 // launches run; TrackRemote → TrackLocal stops run and sets running=false.
 func (f *TrackForwarder) UpdatePublisher(publisher *WebRTCTrack) error {
@@ -192,6 +227,14 @@ func (f *TrackForwarder) UpdatePublisher(publisher *WebRTCTrack) error {
 	}
 	wasRunning := f.running
 	cancel := f.cancel
+	type subSnapshot struct {
+		pc    *PeerConnection
+		entry *subscriberEntry
+	}
+	subs := make([]subSnapshot, 0, len(f.subscribers))
+	for pc, e := range f.subscribers {
+		subs = append(subs, subSnapshot{pc: pc, entry: e})
+	}
 	f.mu.Unlock()
 
 	if wasRunning {
@@ -202,14 +245,44 @@ func (f *TrackForwarder) UpdatePublisher(publisher *WebRTCTrack) error {
 	}
 
 	isRemoteNew := publisher.IsRemote()
+	// The TrackRemote codec is authoritative; placeholders carry none.
+	realCodec := webrtc.RTPCodecParameters{}
+	realMime := ""
+	if isRemoteNew {
+		realCodec = publisher.Codec()
+		realMime = realCodec.MimeType
+	}
 
+	// Swap the source before touching subscribers so concurrent readers
+	// observe the new publisher. The run loop starts after reconciliation.
 	f.mu.Lock()
 	f.publisher = publisher
+	f.mu.Unlock()
+
+	reconciled := 0
+	if isRemoteNew && realMime != "" {
+		trackID := publisher.ID()
+		for _, s := range subs {
+			entryMime := ""
+			if s.entry != nil && s.entry.webTrack != nil {
+				entryMime = s.entry.webTrack.Codec().MimeType
+			}
+			if entryMime == realMime {
+				continue
+			}
+			if f.reconcileSubscriber(s.pc, s.entry, trackID, publisher, realCodec) {
+				reconciled++
+			}
+		}
+	}
+
+	f.mu.Lock()
 	if wasRunning && isRemoteNew {
 		// Remote -> Remote restart: keep running true, relaunch.
 		ctx, newCancel := context.WithCancel(context.Background())
 		f.ctx = ctx
 		f.cancel = newCancel
+		f.running = true
 		f.wg.Add(1)
 		go f.run(ctx)
 	} else if wasRunning && !isRemoteNew {
@@ -232,6 +305,11 @@ func (f *TrackForwarder) UpdatePublisher(publisher *WebRTCTrack) error {
 	queueSize := f.queueSize
 	f.mu.Unlock()
 
+	// Codec invariant: with an authoritative publisher every subscriber
+	// egress MIME must match the publisher MIME. Fail loudly instead of
+	// silently forwarding incompatible RTP.
+	f.checkCodecInvariant(publisher.ID(), realMime, isRemoteNew)
+
 	trackID := publisher.ID()
 	publisherID := ""
 	if dt := publisher.DomainTrack(); dt != nil {
@@ -245,8 +323,167 @@ func (f *TrackForwarder) UpdatePublisher(publisher *WebRTCTrack) error {
 		"publisher_id", publisherID,
 		"is_remote", isRemoteNew,
 		"queue_size", queueSize,
+		"reconciled_subscribers", reconciled,
 	)
 	return nil
+}
+
+// reconcileSubscriber rebuilds one subscriber's egress track from the
+// authoritative publisher codec. The stale sender/TrackLocal is removed and
+// a fresh TrackLocal built from realCodec is added; pion's existing
+// negotiation-needed flow renegotiates the subscriber PC, which re-binds
+// with the correct MIME/PT. Pending queued packets (same payload bytes) move
+// to the fresh queue and are rewritten per the new binding on write.
+//
+// Caller holds lifecycleMu but must NOT hold f.mu (PC calls block on
+// PeerConnection.mu and the writer shutdown joins a goroutine). Returns true
+// when the subscriber was rebuilt.
+func (f *TrackForwarder) reconcileSubscriber(pc *PeerConnection, old *subscriberEntry, trackID string, publisher *WebRTCTrack, realCodec webrtc.RTPCodecParameters) bool {
+	if pc == nil || old == nil || publisher == nil {
+		return false
+	}
+	oldMime := ""
+	if old.webTrack != nil {
+		oldMime = old.webTrack.Codec().MimeType
+	}
+	subscriberID := ""
+	if p := pc.Participant(); p != nil {
+		subscriberID = p.ID()
+	}
+	// Stop the writer; it drains leftovers through the old binding and exits.
+	// In the placeholder→remote transition the queue is necessarily empty
+	// (the run loop never ran), so nothing stale is flushed.
+	if old.cancel != nil {
+		old.cancel()
+	}
+	if old.done != nil {
+		<-old.done
+	}
+
+	f.mu.Lock()
+	delete(f.subscribers, pc)
+	f.mu.Unlock()
+
+	domainTrack := publisher.DomainTrack()
+	if domainTrack == nil && old.webTrack != nil {
+		domainTrack = old.webTrack.DomainTrack()
+	}
+	streamID := trackID + "-forward"
+	newPionTrack, err := webrtc.NewTrackLocalStaticRTP(realCodec.RTPCodecCapability, trackID, streamID)
+	if err != nil {
+		slog.Default().Error("codec reconcile create failed",
+			"event", "codec_reconcile_create_failed",
+			"track_id", trackID,
+			"subscriber_id", subscriberID,
+			"mime", realCodec.MimeType,
+			"error", err,
+		)
+		return false
+	}
+	newWebTrack := NewWebRTCTrack(domainTrack, newPionTrack, realCodec)
+
+	// Remove + re-add under the negotiation gate: sender churn interleaved
+	// with an in-flight exchange makes pion bind the new sender against the
+	// stale negotiated m-line (ErrUnsupportedCodec on the browser's answer).
+	removeErr, err := pc.SwapEgressTrack(trackID, newWebTrack)
+	if removeErr != nil {
+		slog.Default().Warn("codec reconcile remove failed",
+			"event", "codec_reconcile_remove_failed",
+			"track_id", trackID,
+			"subscriber_id", subscriberID,
+			"error", removeErr,
+		)
+	}
+	if err != nil {
+		slog.Default().Error("codec reconcile add failed, subscriber detached",
+			"event", "codec_reconcile_add_failed",
+			"track_id", trackID,
+			"subscriber_id", subscriberID,
+			"mime", realCodec.MimeType,
+			"error", err,
+		)
+		return false
+	}
+
+	// Fresh queue; carry over pending payloads (rewritten per new binding).
+	f.mu.RLock()
+	queueSize := f.queueSize
+	f.mu.RUnlock()
+	if queueSize <= 0 {
+		queueSize = DefaultQueueSize
+	}
+	q := make(chan *rtp.Packet, queueSize)
+drain:
+	for {
+		select {
+		case pkt := <-old.queue:
+			select {
+			case q <- pkt:
+			default:
+				*pkt = rtp.Packet{}
+				packetPool.Put(pkt)
+			}
+		default:
+			break drain
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	newEntry := &subscriberEntry{
+		pc:        pc,
+		pionTrack: newPionTrack,
+		webTrack:  newWebTrack,
+		queue:     q,
+		ctx:       ctx,
+		cancel:    cancel,
+		done:      make(chan struct{}),
+		parent:    f,
+	}
+	f.mu.Lock()
+	if _, exists := f.subscribers[pc]; exists {
+		// Concurrent resubscribe won: it snapshotted the post-swap publisher,
+		// so its track is already correct. Undo ours.
+		f.mu.Unlock()
+		_ = pc.RemoveTrack(trackID)
+		cancel()
+		return false
+	}
+	f.subscribers[pc] = newEntry
+	go newEntry.runWriter()
+	f.mu.Unlock()
+
+	slog.Default().Info("subscriber egress reconciled",
+		"event", "codec_reconciled",
+		"track_id", trackID,
+		"subscriber_id", subscriberID,
+		"old_mime", oldMime,
+		"new_mime", realCodec.MimeType,
+	)
+	return true
+}
+
+// checkCodecInvariant fails loudly when any subscriber egress MIME differs
+// from the authoritative publisher MIME. It is a diagnostic tripwire, not a
+// repair path: reconciliation in UpdatePublisher must leave zero mismatches.
+func (f *TrackForwarder) checkCodecInvariant(trackID, realMime string, authoritative bool) {
+	if !authoritative || realMime == "" {
+		return
+	}
+	f.mu.RLock()
+	mismatched := 0
+	for _, e := range f.subscribers {
+		if e == nil || e.webTrack == nil || e.webTrack.Codec().MimeType != realMime {
+			mismatched++
+		}
+	}
+	f.mu.RUnlock()
+	if mismatched > 0 {
+		slog.Default().Error("subscriber egress codec mismatch",
+			"event", "codec_mismatch",
+			"track_id", trackID,
+			"publisher_mime", realMime,
+			"mismatched_subscribers", mismatched,
+		)
+	}
 }
 
 // IsRunning reports whether the forwarding goroutine is active.
@@ -263,9 +500,27 @@ func (f *TrackForwarder) SubscriberCount() int {
 	return len(f.subscribers)
 }
 
+// HasSubscriber reports whether pc is already attached to this forwarder.
+// It lets signaling distinguish an idempotent client subscribe from a new
+// egress binding without exposing the subscriber map.
+func (f *TrackForwarder) HasSubscriber(pc *PeerConnection) bool {
+	if pc == nil {
+		return false
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	_, ok := f.subscribers[pc]
+	return ok
+}
+
 // AddSubscriber registers pc as a destination for forwarded RTP.
 // It creates a TrackLocalStaticRTP that mirrors the publisher's codec,
 // wraps it in a WebRTCTrack, stores it, and adds it to pc via AddTrack.
+//
+// When the publisher is still a placeholder (codec unknown), the egress
+// codec is inferred provisionally from kind; UpdatePublisher rebuilds the
+// subscriber track once the real TrackRemote codec arrives if the MIME
+// mismatches, so no RTP ever flows long-term through a wrong-codec binding.
 //
 // Lock hierarchy: must call pc.AddTrack outside f.mu (f.mu > pc.mu would
 // invert PeerConnection.mu > TrackForwarder.mu). Snapshot codec/trackID
@@ -325,8 +580,14 @@ func (f *TrackForwarder) AddSubscriber(pc *PeerConnection) error {
 		return err
 	}
 
-	// Preserve full codec parameters on the wrapper so subscribers can inspect them.
-	webTrack := NewWebRTCTrack(domainTrack, pionTrack, codec)
+	// Store the effective (post-fallback) codec params on the wrapper so the
+	// egress MIME is observable: UpdatePublisher reconciles subscribers whose
+	// MIME mismatches the authoritative publisher codec, and the invariant
+	// check compares these MIMEs. The payload type stays the publisher-side
+	// value; the per-binding egress PT is assigned by pion at Bind.
+	effectiveCodec := codec
+	effectiveCodec.RTPCodecCapability = capability
+	webTrack := NewWebRTCTrack(domainTrack, pionTrack, effectiveCodec)
 
 	queueSize := f.queueSize
 	if queueSize <= 0 {
@@ -342,6 +603,7 @@ func (f *TrackForwarder) AddSubscriber(pc *PeerConnection) error {
 		ctx:       ctx,
 		cancel:    cancel,
 		done:      make(chan struct{}),
+		parent:    f,
 	}
 
 	// Call outside f.mu to respect PeerConnection.mu > TrackForwarder.mu.
@@ -356,11 +618,25 @@ func (f *TrackForwarder) AddSubscriber(pc *PeerConnection) error {
 		f.mu.Unlock()
 		_ = pc.RemoveTrack(trackID)
 		cancel()
+		slog.Default().Info("subscriber add raced, undone",
+			"event", "subscriber_add_raced",
+			"track_id", trackID,
+		)
 		return nil
 	}
 	f.subscribers[pc] = entry
 	go entry.runWriter()
 	f.mu.Unlock()
+	subscriberID := ""
+	if p := pc.Participant(); p != nil {
+		subscriberID = p.ID()
+	}
+	slog.Default().Info("subscriber added",
+		"event", "subscriber_added",
+		"track_id", trackID,
+		"subscriber_id", subscriberID,
+		"mime", capability.MimeType,
+	)
 	return nil
 }
 
@@ -393,6 +669,15 @@ func (f *TrackForwarder) RemoveSubscriber(pc *PeerConnection) error {
 
 	// Call outside f.mu to respect PeerConnection.mu > TrackForwarder.mu.
 	_ = pc.RemoveTrack(trackID)
+	subscriberID := ""
+	if p := pc.Participant(); p != nil {
+		subscriberID = p.ID()
+	}
+	slog.Default().Info("subscriber removed",
+		"event", "subscriber_removed",
+		"track_id", trackID,
+		"subscriber_id", subscriberID,
+	)
 
 	return nil
 }
@@ -583,6 +868,7 @@ func (f *TrackForwarder) WriteRTP(pkt *rtp.Packet) error {
 		// Fast-path: queue full, avoid clone alloc.
 		if len(e.queue) == cap(e.queue) {
 			dropped := atomic.AddUint64(&e.droppedCount, 1)
+			f.packetsDropped.Add(1)
 			queueDepth := len(e.queue)
 			subscriberID := ""
 			if e.pc != nil {
@@ -608,9 +894,15 @@ func (f *TrackForwarder) WriteRTP(pkt *rtp.Packet) error {
 		clone := clonePacket(pkt)
 		select {
 		case e.queue <- clone:
+			f.packetsForwarded.Add(1)
+			f.lastSeq.Store(uint64(pkt.Header.SequenceNumber))
+			f.lastTimestamp.Store(uint64(pkt.Header.Timestamp))
+			f.lastSSRC.Store(uint64(pkt.Header.SSRC))
+			f.lastPayloadType.Store(uint64(pkt.Header.PayloadType))
 		default:
 			// Queue became full between len check and send (race): return clone to pool.
 			dropped := atomic.AddUint64(&e.droppedCount, 1)
+			f.packetsDropped.Add(1)
 			queueDepth := len(e.queue)
 			subscriberID := ""
 			if e.pc != nil {
@@ -696,6 +988,31 @@ func (f *TrackForwarder) ResetDropped() {
 	f.lastDropLog.Store(0)
 }
 
+// Media counter accessors. Read-only snapshots.
+func (f *TrackForwarder) PacketsReceived() uint64  { return f.packetsReceived.Load() }
+func (f *TrackForwarder) PacketsForwarded() uint64 { return f.packetsForwarded.Load() }
+func (f *TrackForwarder) PacketsWritten() uint64   { return f.packetsWritten.Load() }
+func (f *TrackForwarder) PacketsDropped() uint64   { return f.packetsDropped.Load() }
+func (f *TrackForwarder) BytesReceived() uint64    { return f.bytesReceived.Load() }
+
+// NextFIRSequenceNumber mints the next FIR entry sequence number for this
+// track. Relayed FIRs share one per-track sequence space (starting at 1)
+// across all subscribers so the publisher can dedupe requests.
+func (f *TrackForwarder) NextFIRSequenceNumber() uint8 {
+	return uint8(f.firSeq.Add(1))
+}
+func (f *TrackForwarder) LastSeq() uint16        { return uint16(f.lastSeq.Load()) }
+func (f *TrackForwarder) LastTimestamp() uint32  { return uint32(f.lastTimestamp.Load()) }
+func (f *TrackForwarder) LastSSRC() uint32       { return uint32(f.lastSSRC.Load()) }
+func (f *TrackForwarder) LastPayloadType() uint8 { return uint8(f.lastPayloadType.Load()) }
+
+// DiagSnapshot returns a log-ready snapshot of forwarder media counters.
+func (f *TrackForwarder) DiagSnapshot() (recv, fwd, written, dropped uint64, seq uint16, ts uint32, ssrc uint32, pt uint8) {
+	return f.packetsReceived.Load(), f.packetsForwarded.Load(), f.packetsWritten.Load(),
+		f.packetsDropped.Load(), uint16(f.lastSeq.Load()), uint32(f.lastTimestamp.Load()),
+		uint32(f.lastSSRC.Load()), uint8(f.lastPayloadType.Load())
+}
+
 // Write forwards a raw RTP buffer to every subscriber by unmarshaling it
 // into a packet and calling WriteRTP. See WriteRTP for backpressure semantics.
 func (f *TrackForwarder) Write(b []byte) (int, error) {
@@ -777,6 +1094,8 @@ func (f *TrackForwarder) run(ctx context.Context) {
 			if err := pkt.Unmarshal(buf[:res.n]); err != nil {
 				continue
 			}
+			f.packetsReceived.Add(1)
+			f.bytesReceived.Add(uint64(res.n))
 			_ = f.WriteRTP(pkt)
 		}
 	}

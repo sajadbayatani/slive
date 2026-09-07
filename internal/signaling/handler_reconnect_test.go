@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	pionwebrtc "github.com/pion/webrtc/v3"
 	webrtc "github.com/sajadbayatani/slive/internal/webrtc"
 )
 
@@ -98,11 +97,10 @@ func TestHandleConnectionClosedKeepsSessionAlive(t *testing.T) {
 		t.Fatal("rejoin created a new peer connection instead of reusing the live one")
 	}
 
-	// Prove the sender swap took effect: a new transceiver fires
-	// negotiation-needed and the automatic offer lands on the NEW sender.
-	if _, err := pc2.PionPeerConnection().AddTransceiverFromKind(pionwebrtc.RTPCodecTypeAudio); err != nil {
-		t.Fatalf("AddTransceiverFromKind: %v", err)
-	}
+	// Prove the sender swap took effect: a real subscription (AddTrack +
+	// the sync drive, as the handler performs on subscribe) and the
+	// automatic offer lands on the NEW sender.
+	driveSubscriberOffer(t, pc2, "reconnect-audio")
 	waitForMessageOnSender(t, senderB, "webrtc:offer", "swapped-in sender after reconnect")
 	select {
 	case msgType := <-senderA:
