@@ -38,9 +38,13 @@ const (
 	DefaultWSWriteTimeout   = 10 * time.Second
 )
 
-// Load reads runtime configuration. Comma-separated STUN_SERVERS and
-// TURN_SERVERS values are supported; TURN_USERNAME and TURN_CREDENTIAL apply
-// to each configured TURN server.
+// Load reads runtime configuration. Comma-separated STUN_SERVERS and TURN
+// server values are supported. TURN endpoints come from TURN_SERVER (singular,
+// preferred) with TURN_SERVERS as a legacy fallback; the credential comes
+// from TURN_PASSWORD (preferred) with TURN_CREDENTIAL as a legacy fallback.
+// TURN_USERNAME applies to each configured TURN server. TURN_REALM is a
+// coturn-side setting (see deploy/coturn/turnserver.conf) and is not consumed
+// here — pion has no realm field.
 func Load() Config {
 	cfg := Config{
 		HTTPAddr:         envOrDefault("HTTP_ADDR", DefaultHTTPAddr),
@@ -58,15 +62,26 @@ func Load() Config {
 		cfg.WSPingInterval = cfg.WSReadTimeout / 2
 	}
 
-	if turnURLs := splitServerURLs(os.Getenv("TURN_SERVERS")); len(turnURLs) > 0 {
+	if turnURLs := splitServerURLs(firstNonEmpty(os.Getenv("TURN_SERVER"), os.Getenv("TURN_SERVERS"))); len(turnURLs) > 0 {
 		cfg.TURNServers = []TURNServer{{
 			URLs:       turnURLs,
 			Username:   os.Getenv("TURN_USERNAME"),
-			Credential: os.Getenv("TURN_CREDENTIAL"),
+			Credential: firstNonEmpty(os.Getenv("TURN_PASSWORD"), os.Getenv("TURN_CREDENTIAL")),
 		}}
 	}
 
 	return cfg
+}
+
+// firstNonEmpty returns the first non-empty value, used for preferred-over-
+// legacy environment variable aliases.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func envOrDefault(name, fallback string) string {

@@ -77,16 +77,50 @@ func main() {
 // configuration: ICE servers are translated from STUN_SERVERS/TURN_SERVERS
 // and the application's structured logger is propagated into every peer
 // connection and signaling session.
+//
+// DIAG-TURN: logs the effective ICE/TURN configuration at startup (TURN
+// URL, username, realm, credential presence — never the secret itself) so a
+// live test can prove which relay the server-side PCs gather from.
 func newSignalingHandler(cfg config.Config, log *logger.Logger) *signaling.Handler {
+	pcConfig := buildPeerConnectionConfig(cfg)
+	logTurnDiagnostics(cfg, pcConfig, log)
 	return signaling.NewHandler(
 		signaling.NewRoomManager(),
-		signaling.WithPeerConnectionConfig(buildPeerConnectionConfig(cfg)),
+		signaling.WithPeerConnectionConfig(pcConfig),
 		signaling.WithLogger(log.Logger),
 		signaling.WithGCTTL(cfg.GCParticipantTTL),
 		signaling.WithAllowedOrigins(cfg.WSAllowedOrigins),
 		signaling.WithWSReadTimeout(cfg.WSReadTimeout),
 		signaling.WithWSPingInterval(cfg.WSPingInterval),
 		signaling.WithWSWriteTimeout(cfg.WSWriteTimeout),
+	)
+}
+
+// logTurnDiagnostics emits one startup line proving the effective ICE/TURN
+// configuration. TURN URL, username and realm are logged; the credential
+// itself is never logged, only whether one is set. This is diagnostic
+// only: it changes no SDP, forwarding or transceiver behavior.
+func logTurnDiagnostics(cfg config.Config, pcConfig webrtc.PeerConnectionConfig, log *logger.Logger) {
+	var turnURLs []string
+	var turnUsername string
+	credentialSet := false
+	for _, server := range cfg.TURNServers {
+		turnURLs = append(turnURLs, server.URLs...)
+		if turnUsername == "" {
+			turnUsername = server.Username
+		}
+		if server.Credential != "" {
+			credentialSet = true
+		}
+	}
+	log.Info("ice/turn configuration",
+		"event", "ice_turn_config",
+		"turn_urls", turnURLs,
+		"turn_username", turnUsername,
+		"turn_realm", os.Getenv("TURN_REALM"),
+		"turn_credential_set", credentialSet,
+		"stun_servers", cfg.STUNServers,
+		"ice_servers_count", len(pcConfig.ICEServers),
 	)
 }
 

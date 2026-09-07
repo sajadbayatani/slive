@@ -164,6 +164,63 @@ Slive uses a WebSocket-based signaling protocol for real-time session negotiatio
 
 For detailed message formats and examples, see [docs/signaling-protocol.md](docs/signaling-protocol.md).
 
+### Local TURN (coturn)
+
+When browsers and Slive cannot reach each other directly (NAT, VPN, Docker bridge, missing hairpin), a TURN
+relay gives every PeerConnection a guaranteed path. The repo ships a local coturn via Docker Compose.
+STUN keeps working alongside it; TURN is purely an additional relay fallback.
+
+**1. Set credentials (never commit real ones):**
+
+```bash
+export TURN_USERNAME=slive
+export TURN_PASSWORD='<pick-a-strong-secret>'
+export TURN_REALM=slive.local   # optional, defaults to slive.local
+```
+
+**2. Start coturn (UDP 3478 + TCP fallback + relay window 49160–49170/udp):**
+
+```bash
+docker compose up -d coturn
+docker compose logs -f coturn   # expect "listening", then "allocate" entries during calls
+```
+
+**3. Verify the relay allocates (from the laptop):**
+
+```bash
+# needs a turn client; brew install coturn provides turnutils_uclient on macOS
+turnutils_uclient -u "$TURN_USERNAME" -w "$TURN_PASSWORD" -p 3478 127.0.0.1
+# expect: "allocate ... relay ..." / "success" — Ctrl-C to quit
+```
+
+Or in any browser devtools console (proves a `relay` candidate is gathered):
+
+```js
+const pc = new RTCPeerConnection({ iceServers: [
+  { urls: ["turn:127.0.0.1:3478"], username: "slive", credential: "<secret>" },
+]});
+pc.onicecandidate = (e) => e.candidate && console.log(e.candidate.type, e.candidate.protocol, e.candidate.address);
+pc.createDataChannel("t"); await pc.setLocalDescription(await pc.createOffer());
+// expect a line starting with: relay udp ...
+```
+
+**4. Point Slive at it (same names the browsers use):**
+
+```bash
+TURN_SERVER=turn:127.0.0.1:3478 TURN_USERNAME=slive TURN_PASSWORD='<secret>' go run ./cmd/slive
+```
+
+**5. Exact TURN URL format for Smeeting (`RTCPeerConnection` `iceServers`):**
+
+```js
+{ urls: ["turn:<reachable-host>:3478"], username: "<TURN_USERNAME>", credential: "<TURN_PASSWORD>" }
+// UDP is the default transport; TCP fallback: "turn:<reachable-host>:3478?transport=tcp"
+```
+
+`<reachable-host>` must be reachable **from the browsers**: same-laptop testing → laptop LAN IP/hostname
+(or `localhost`/`127.0.0.1` when coturn's ports are published locally). Never use a Docker container IP on
+Docker Desktop — browsers cannot route to it. Keep `STUN_SERVERS` as-is; stop with `docker compose down`.
+
 ---
 
 ## Go SDK (`pkg/slive`)
