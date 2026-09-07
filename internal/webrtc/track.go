@@ -137,6 +137,19 @@ func (t *WebRTCTrack) IsRemote() bool {
 	return ok
 }
 
+// RemoteSSRC returns the publisher-ingress media SSRC when the underlying
+// track is a real TrackRemote. The keyframe-feedback relay addresses the
+// upstream PLI/FIR to this SSRC. Placeholders (TrackLocal) report ok=false.
+func (t *WebRTCTrack) RemoteSSRC() (uint32, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	remote, ok := t.track.(*webrtc.TrackRemote)
+	if !ok || remote == nil {
+		return 0, false
+	}
+	return uint32(remote.SSRC()), true
+}
+
 // Close closes the underlying WebRTC track.
 func (t *WebRTCTrack) Close() error {
 	t.mu.Lock()

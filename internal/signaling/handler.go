@@ -1,6 +1,7 @@
 package signaling
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/rtcp"
 	pionwebrtc "github.com/pion/webrtc/v3"
 	"github.com/sajadbayatani/slive/internal/domain"
 	webrtc "github.com/sajadbayatani/slive/internal/webrtc"
@@ -505,10 +507,170 @@ func (h *Handler) ensurePeerConnection(participant *domain.Participant, sender w
 				"track_id", track.ID(),
 				"error", err,
 			)
+			return
+		}
+		// A real TrackRemote means the publisher's initial offer/answer has
+		// completed. Attach it to existing participants now, rather than
+		// racing the publisher's first negotiation from publish_track.
+		if room := participant.Room(); room != nil && room.GetTrack(track.ID()) != nil {
+			h.autoSubscribeExistingParticipants(room, participant, track.ID())
+		}
+	})
+	// Observe subscriber RTCP feedback (PLI/FIR) and relay keyframe requests
+	// upstream via relayKeyframeRequest (RTCP-to-RTCP, no signaling message,
+	// no RTP changes). Other feedback types need no action. Locks are taken
+	// sequentially (never nested) to preserve the lock hierarchy.
+	pc.SetRTCPObserver(func(trackID string, packet rtcp.Packet) {
+		kind, senderSSRC, mediaSSRC, ok := rtcpFeedbackIdentity(packet)
+		if !ok {
+			return
+		}
+		if kind == "PLI" || kind == "FIR" {
+			h.relayKeyframeRequest(pc, trackID, kind, senderSSRC, mediaSSRC)
 		}
 	})
 
 	return pc, nil
+}
+
+// publisherIDForTrack resolves the publisher participant ID for a forwarded
+// track, or "" when the track has no forwarder/publisher. Lock-free
+// sequencing: getForwarder takes and releases its own lock.
+func (h *Handler) publisherIDForTrack(trackID string) string {
+	if fw := h.getForwarder(trackID); fw != nil {
+		if pt := fw.PublisherTrack(); pt != nil {
+			if dt := pt.DomainTrack(); dt != nil {
+				if pub := dt.Publisher(); pub != nil {
+					return pub.ID()
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// relayKeyframeRequest routes one subscriber PLI/FIR upstream to the
+// publisher's PeerConnection (RTCP-to-RTCP; no signaling message, no RTP
+// changes). It returns (forwarded, publisherID).
+//
+// Routing (never blind):
+//  1. trackID -> forwarder (drops feedback for unknown tracks);
+//  2. subscriber MediaSSRC -> subscribed track via the subscriber PC's
+//     egress SSRC map (drops feedback for unknown/unmapped SSRCs, so a PLI
+//     can never reach an unrelated publisher);
+//  3. forwarder -> publisher participant -> publisher PC;
+//  4. publisher-ingress media SSRC from the publisher's TrackRemote;
+//  5. fresh PLI/FIR addressed to the publisher-ingress SSRC is sent with
+//     publisherPC.WriteRTCP().
+//
+// The subscriber-side SSRC is never reused as the media SSRC: pion rewrites
+// SSRC per subscriber binding on egress, so the two sides differ by design.
+// The upstream SenderSSRC preserves the subscriber's RTCP sender SSRC for
+// traceability; the publisher keys the request off MediaSSRC. FIR entries
+// draw sequence numbers from the forwarder's per-track space.
+func (h *Handler) relayKeyframeRequest(subPC *webrtc.PeerConnection, trackID, kind string, senderSSRC, mediaSSRC uint32) (bool, string) {
+	if subPC == nil {
+		return false, ""
+	}
+	fw := h.getForwarder(trackID)
+	if fw == nil {
+		return false, ""
+	}
+	// SSRC-gated track resolution: the PLI's MediaSSRC must be this track's
+	// egress SSRC on this subscriber PC.
+	if mappedTrack, ok := subPC.EgressSSRCMap()[mediaSSRC]; !ok || mappedTrack != trackID {
+		return false, h.publisherIDForTrack(trackID)
+	}
+	publisherID := h.publisherIDForTrack(trackID)
+	if publisherID == "" {
+		return false, ""
+	}
+	pubPC := h.getPeerConnection(publisherID)
+	if pubPC == nil {
+		return false, publisherID
+	}
+	pubTrack := fw.PublisherTrack()
+	if pubTrack == nil {
+		return false, publisherID
+	}
+	publisherSSRC, ok := pubTrack.RemoteSSRC()
+	if !ok {
+		return false, publisherID
+	}
+	var pkt rtcp.Packet
+	switch kind {
+	case "PLI":
+		pkt = &rtcp.PictureLossIndication{SenderSSRC: senderSSRC, MediaSSRC: publisherSSRC}
+	case "FIR":
+		pkt = &rtcp.FullIntraRequest{
+			SenderSSRC: senderSSRC,
+			MediaSSRC:  publisherSSRC,
+			FIR:        []rtcp.FIREntry{{SSRC: publisherSSRC, SequenceNumber: fw.NextFIRSequenceNumber()}},
+		}
+	default:
+		return false, publisherID
+	}
+	if err := pubPC.WriteRTCP([]rtcp.Packet{pkt}); err != nil {
+		return false, publisherID
+	}
+	return true, publisherID
+}
+
+// requestUpstreamKeyframe asks the publisher encoder for a fresh keyframe
+// for trackID (RTCP PLI via the publisher PC, no signaling message, no RTP
+// changes). It is Slive-initiated (no subscriber SSRC to validate), so the
+// upstream SenderSSRC reuses the publisher-ingress SSRC for traceability;
+// publishers key the request off MediaSSRC. No-ops unless a real remote
+// publisher track with a live PC exists. Called after subscribe-attach and
+// after publisher swaps with subscribers present, so late subscribers get a
+// decodable keyframe without waiting for their own PLI round-trip.
+func (h *Handler) requestUpstreamKeyframe(trackID string) {
+	fw := h.getForwarder(trackID)
+	if fw == nil {
+		return
+	}
+	pt := fw.PublisherTrack()
+	if pt == nil || !pt.IsRemote() {
+		return
+	}
+	pubSSRC, ok := pt.RemoteSSRC()
+	if !ok || pubSSRC == 0 {
+		return
+	}
+	publisherID := h.publisherIDForTrack(trackID)
+	if publisherID == "" {
+		return
+	}
+	pubPC := h.getPeerConnection(publisherID)
+	if pubPC == nil {
+		return
+	}
+	pkt := &rtcp.PictureLossIndication{SenderSSRC: pubSSRC, MediaSSRC: pubSSRC}
+	if err := pubPC.WriteRTCP([]rtcp.Packet{pkt}); err != nil {
+		h.logger.Warn("upstream keyframe request failed",
+			"event", "upstream_keyframe_request_failed",
+			"track_id", trackID,
+			"publisher_id", publisherID,
+			"publisher_media_ssrc", pubSSRC,
+			"error", err,
+		)
+	}
+}
+
+// rtcpFeedbackIdentity extracts (kind, sender SSRC, media SSRC) from
+// keyframe/loss feedback RTCP packets. ok=false for all other RTCP types
+// (TWCC, SR/RR, REMB, SDES...), which the observer skips.
+func rtcpFeedbackIdentity(packet rtcp.Packet) (kind string, senderSSRC, mediaSSRC uint32, ok bool) {
+	switch pkt := packet.(type) {
+	case *rtcp.PictureLossIndication:
+		return "PLI", pkt.SenderSSRC, pkt.MediaSSRC, true
+	case *rtcp.FullIntraRequest:
+		return "FIR", pkt.SenderSSRC, pkt.MediaSSRC, true
+	case *rtcp.TransportLayerNack:
+		return "NACK", pkt.SenderSSRC, pkt.MediaSSRC, true
+	default:
+		return "", 0, 0, false
+	}
 }
 
 // --- SFU forwarder registry helpers ---
@@ -537,8 +699,17 @@ func (h *Handler) getOrCreateForwarder(trackID string, publisherTrack *webrtc.We
 		h.trackForwardersMutex.RUnlock()
 		if publisherTrack.IsRemote() {
 			if pt := fw.PublisherTrack(); pt != nil && !pt.IsRemote() {
+				h.logger.Info("forwarder publisher swap starting",
+					"event", "forwarder_swap_start",
+					"track_id", trackID,
+				)
 				if err := fw.UpdatePublisher(publisherTrack); err != nil {
 					return nil, err
+				}
+				// The swap may have reconciled subscriber egress codecs;
+				// request a fresh keyframe so they decode immediately.
+				if fw.SubscriberCount() > 0 {
+					h.requestUpstreamKeyframe(trackID)
 				}
 			}
 		}
@@ -547,26 +718,135 @@ func (h *Handler) getOrCreateForwarder(trackID string, publisherTrack *webrtc.We
 	h.trackForwardersMutex.RUnlock()
 
 	h.trackForwardersMutex.Lock()
-	defer h.trackForwardersMutex.Unlock()
+	// swappedWithSubs defers the upstream keyframe request until after the
+	// map lock is released: requestUpstreamKeyframe takes getForwarder's
+	// RLock, which would self-deadlock under the write lock.
+	swappedWithSubs := false
 	if fw := h.trackForwarders[trackID]; fw != nil {
 		if publisherTrack.IsRemote() {
 			if pt := fw.PublisherTrack(); pt != nil && !pt.IsRemote() {
+				h.logger.Info("forwarder publisher swap starting",
+					"event", "forwarder_swap_start",
+					"track_id", trackID,
+				)
 				if err := fw.UpdatePublisher(publisherTrack); err != nil {
+					h.trackForwardersMutex.Unlock()
 					return nil, err
 				}
+				swappedWithSubs = fw.SubscriberCount() > 0
 			}
+		}
+		h.trackForwardersMutex.Unlock()
+		if swappedWithSubs {
+			h.requestUpstreamKeyframe(trackID)
 		}
 		return fw, nil
 	}
 	fw, err := webrtc.NewTrackForwarderWithConfig(publisherTrack, h.forwarderConfig)
 	if err != nil {
+		h.trackForwardersMutex.Unlock()
 		return nil, err
 	}
 	if err := fw.Start(); err != nil {
+		h.trackForwardersMutex.Unlock()
 		return nil, err
 	}
 	h.trackForwarders[trackID] = fw
+	h.trackForwardersMutex.Unlock()
+	h.logger.Info("forwarder created",
+		"event", "forwarder_created",
+		"track_id", trackID,
+		"is_remote", publisherTrack.IsRemote(),
+	)
 	return fw, nil
+}
+
+// adoptOrphanForwarder merges a wire-ID forwarder left behind by Ordering B
+// (WebRTC OnTrack fired before publish_track, or the browser wire track ID
+// differs from the signaled ID) into the signaled-ID forwarder for sigTrack.
+//
+// It scans for a forwarder that (a) is keyed by a different ID, (b) wraps a
+// real remote publisher track of the same participant and kind, and (c) is an
+// orphan, i.e. its ID is not a track registered in the room. When found, the
+// orphan is stopped and removed, and the signaled-ID forwarder is created (or
+// swapped, if a placeholder already exists) around the same TrackRemote
+// re-wrapped in the signaled domain track, so every subscriber-facing ID
+// stays the signaled one. Returns true when an adoption happened.
+//
+// Locking: takes trackForwardersMutex only for the scan; removal and creation
+// go through removeForwarder/getOrCreateForwarder, preserving the
+// peerConnectionsMutex > trackForwardersMutex order (no PC lock held here).
+func (h *Handler) adoptOrphanForwarder(room *domain.Room, sigTrack *domain.Track, participant *domain.Participant) bool {
+	if room == nil || sigTrack == nil || participant == nil {
+		return false
+	}
+	sigID := sigTrack.ID()
+
+	h.trackForwardersMutex.RLock()
+	var orphan *webrtc.TrackForwarder
+	orphanID := ""
+	for id, fw := range h.trackForwarders {
+		if id == sigID {
+			continue
+		}
+		pt := fw.PublisherTrack()
+		if pt == nil || !pt.IsRemote() {
+			continue
+		}
+		dt := pt.DomainTrack()
+		if dt == nil || dt.Kind() != sigTrack.Kind() {
+			continue
+		}
+		pub := dt.Publisher()
+		if pub == nil || pub.ID() != participant.ID() {
+			continue
+		}
+		if room.GetTrack(id) != nil {
+			// A legitimately registered track's forwarder: never steal it
+			// (e.g. a second same-kind track from the same participant).
+			continue
+		}
+		orphan, orphanID = fw, id
+		break
+	}
+	h.trackForwardersMutex.RUnlock()
+
+	if orphan == nil {
+		return false
+	}
+
+	orphanPub := orphan.PublisherTrack()
+	remote, ok := orphanPub.PionTrack().(*pionwebrtc.TrackRemote)
+	if !ok || remote == nil {
+		return false
+	}
+	codec := orphanPub.Codec()
+	adopted := webrtc.NewWebRTCTrack(sigTrack, remote, codec)
+
+	// Stop the orphan first so two run loops never Read the same TrackRemote
+	// concurrently, then bind the signaled forwarder to the real track.
+	// getOrCreateForwarder creates it fresh, or swaps a placeholder via
+	// UpdatePublisher when one already exists.
+	h.removeForwarder(orphanID)
+	if _, err := h.getOrCreateForwarder(sigID, adopted); err != nil {
+		h.logger.Warn("failed to adopt orphan forwarder",
+			"event", "forwarder_adopt_failed",
+			"participant_id", participant.ID(),
+			"track_id", sigID,
+			"orphan_track_id", orphanID,
+			"error", err,
+		)
+		return false
+	}
+	h.logger.Info("forwarder adopted orphan wire-ID track",
+		"event", "forwarder_adopted",
+		"room_id", room.ID(),
+		"participant_id", participant.ID(),
+		"track_id", sigID,
+		"orphan_track_id", orphanID,
+		"kind", sigTrack.Kind().String(),
+	)
+	return true
 }
 
 // removeForwarder stops the forwarder for trackID and removes it from the registry.
@@ -652,27 +932,18 @@ func (h *Handler) removeSubscriberFromAllForwarders(pc *webrtc.PeerConnection) {
 // createPublisherWebRTCTrack builds a WebRTCTrack wrapping domainTrack with a
 // Pion TrackLocalStaticRTP suitable for AddTrack. Codec is inferred from kind.
 func (h *Handler) createPublisherWebRTCTrack(domainTrack *domain.Track) (*webrtc.WebRTCTrack, error) {
-	var capability pionwebrtc.RTPCodecCapability
-	switch domainTrack.Kind() {
-	case domain.TrackKindAudio:
-		capability = pionwebrtc.RTPCodecCapability{
-			MimeType:    pionwebrtc.MimeTypeOpus,
-			ClockRate:   48000,
-			Channels:    2,
-			SDPFmtpLine: "",
-		}
-	default:
-		capability = pionwebrtc.RTPCodecCapability{
-			MimeType:  pionwebrtc.MimeTypeVP8,
-			ClockRate: 90000,
-		}
-	}
-	pionTrack, err := pionwebrtc.NewTrackLocalStaticRTP(capability, domainTrack.ID(), domainTrack.ID()+"-stream")
+	// Codec is UNKNOWN until the real TrackRemote arrives (OnTrack). The
+	// stored codec params stay zero-valued so no consumer mistakes the
+	// placeholder for an authoritative source; AddSubscriber infers a
+	// provisional egress codec from kind and UpdatePublisher reconciles
+	// subscribers once the real codec is known. The pion object is never
+	// bound (never added to any PC), so an empty capability fails loudly
+	// if it is ever misused instead of silently masquerading as VP8/Opus.
+	pionTrack, err := pionwebrtc.NewTrackLocalStaticRTP(pionwebrtc.RTPCodecCapability{}, domainTrack.ID(), domainTrack.ID()+"-stream")
 	if err != nil {
 		return nil, err
 	}
-	codecParams := pionwebrtc.RTPCodecParameters{RTPCodecCapability: capability}
-	return webrtc.NewWebRTCTrack(domainTrack, pionTrack, codecParams), nil
+	return webrtc.NewWebRTCTrack(domainTrack, pionTrack, pionwebrtc.RTPCodecParameters{}), nil
 }
 
 // handleMessage handles a single message from a connection.
@@ -719,26 +990,67 @@ func (h *Handler) handleMessage(conn *Connection, room *domain.Room, participant
 }
 
 // handleCreateRoom handles a create room request.
+// It is idempotent: creating an already-existing room with an already-joined
+// participant returns success instead of participant_already_exists, matching
+// the SDK Client.JoinRoom contract (B-4) and preventing duplicate lifecycle
+// errors when the WebSocket auto-join (handleConnection) and an explicit
+// create_room message race for the same room/participant.
 func (h *Handler) handleCreateRoom(conn *Connection, msg *Message) error {
 	var req CreateRoomRequest
 	if err := msg.UnmarshalData(&req); err != nil {
 		return err
 	}
 
-	// Create the room
-	room, err := h.roomManager.CreateRoom(req.RoomID)
+	room, err := h.roomManager.GetOrCreateRoom(req.RoomID)
 	if err != nil {
 		return err
 	}
 
-	// Create the participant
+	// If participant already in room, treat as idempotent success (no duplicate Join).
+	if existing := room.GetParticipant(req.ParticipantID); existing != nil {
+		resp := RoomCreatedResponse{
+			RoomID:        req.RoomID,
+			ParticipantID: req.ParticipantID,
+			Status:        "success",
+		}
+		return conn.Send(MessageTypeRoomCreated, resp)
+	}
+
 	participant := domain.NewParticipant(req.ParticipantID, req.ParticipantName)
 	if err := room.Join(participant); err != nil {
+		// Race: another goroutine (auto-join or concurrent create) won.
+		if existing := room.GetParticipant(req.ParticipantID); existing != nil {
+			resp := RoomCreatedResponse{
+				RoomID:        req.RoomID,
+				ParticipantID: req.ParticipantID,
+				Status:        "success",
+			}
+			return conn.Send(MessageTypeRoomCreated, resp)
+		}
 		return err
 	}
 	participant.SetRoom(room)
 
-	// Send response
+	// Ensure a peer connection exists for the newly created participant
+	// (the auto-join path in handleConnection does this, but a pure
+	// create_room via message must also have one). If the WS transport is
+	// the same participant, bind the sender to the new PC so future
+	// negotiation/ICE pushes use this socket.
+	if conn.ID() == req.ParticipantID && conn.RoomID() == req.RoomID {
+		sender := func(msgType string, data interface{}) error {
+			return conn.Send(MessageType(msgType), data)
+		}
+		if _, err := h.ensurePeerConnection(participant, sender); err != nil {
+			h.logger.Warn("failed to create peer connection for create_room",
+				"event", "peer_connection_create_failed",
+				"participant_id", participant.ID(),
+				"error", err,
+			)
+		} else {
+			h.broadcastParticipantJoined(room, participant)
+		}
+	}
+
 	resp := RoomCreatedResponse{
 		RoomID:        req.RoomID,
 		ParticipantID: req.ParticipantID,
@@ -885,7 +1197,14 @@ func (h *Handler) handlePublishTrack(conn *Connection, room *domain.Room, partic
 	// OnTrack and the forwarder will forward via WriteRTP. If a local track
 	// already exists on the publisher PC (e.g. from a previous AddTrack via
 	// another path), prefer that track as the forwarder source.
-	if h.getForwarder(track.ID()) == nil {
+	//
+	// Ordering-B adoption: when the publisher's WebRTC OnTrack fired before
+	// this publish_track (or the browser wire track ID differs from the
+	// signaled ID), a real remote-backed "orphan" forwarder may already exist
+	// under the wire ID. Adopt it into the signaled-ID forwarder instead of
+	// leaving two forwarders (one with RTP and no subscribers, one with
+	// subscribers and no RTP).
+	if h.getForwarder(track.ID()) == nil && !h.adoptOrphanForwarder(room, track, participant) {
 		// Prefer an existing local track on the publisher PC if present.
 		var publisherWebTrack *webrtc.WebRTCTrack
 		if pc := h.getPeerConnection(participant.ID()); pc != nil {
@@ -921,7 +1240,15 @@ func (h *Handler) handlePublishTrack(conn *Connection, room *domain.Room, partic
 			}
 		}
 	}
-
+	// If OnTrack arrived before publish_track, adoptOrphanForwarder above has
+	// just rebound the real remote track under the signaled ID. The OnTrack
+	// callback could not attach it then because the room had no publication;
+	// attach it now, but never attach a provisional placeholder here.
+	if fw := h.getForwarder(track.ID()); fw != nil {
+		if publisherTrack := fw.PublisherTrack(); publisherTrack != nil && publisherTrack.IsRemote() {
+			h.autoSubscribeExistingParticipants(room, participant, track.ID())
+		}
+	}
 	// Send response
 	resp := TrackPublishedResponse{
 		TrackID:       req.Track.ID,
@@ -950,6 +1277,116 @@ func (h *Handler) handlePublishTrack(conn *Connection, room *domain.Room, partic
 	h.broadcastTrackAvailable(room, participant, track)
 
 	return nil
+}
+
+// autoSubscribeExistingParticipants attaches trackID to every other live
+// participant in room and drives the subscriber-side renegotiation. The
+// domain subscription registry remains client-driven; this server-side SFU
+// attachment makes live publication symmetric while preserving the existing
+// subscribe_track protocol and its duplicate/error semantics.
+func (h *Handler) autoSubscribeExistingParticipants(room *domain.Room, publisher *domain.Participant, trackID string) {
+	fw := h.getForwarder(trackID)
+	if fw == nil {
+		return
+	}
+	for _, participantID := range room.Participants() {
+		if participantID == publisher.ID() {
+			continue
+		}
+		pc := h.getPeerConnection(participantID)
+		if pc == nil {
+			continue
+		}
+		// Do not start a server-initiated negotiation before the participant's
+		// initial browser offer has been answered. Once the browser offer is
+		// stable, a connecting PC can safely queue the subscriber offer behind
+		// ICE/DTLS establishment.
+		if !h.subscriberReadyForAutomaticAttach(pc) {
+			continue
+		}
+		alreadyAttached := fw.HasSubscriber(pc)
+		if err := fw.AddSubscriber(pc); err != nil {
+			h.logger.Warn("automatic subscriber attach failed",
+				"event", "automatic_subscriber_attach_failed",
+				"track_id", trackID,
+				"publisher_id", publisher.ID(),
+				"subscriber_id", participantID,
+				"error", err,
+			)
+			continue
+		}
+		h.logger.Info("automatic subscriber attached",
+			"event", "automatic_subscriber_attached",
+			"track_id", trackID,
+			"publisher_id", publisher.ID(),
+			"subscriber_id", participantID,
+		)
+		if !alreadyAttached {
+			go pc.RequestSubscriberOffer()
+		}
+	}
+}
+
+// subscriberReadyForAutomaticAttach reports whether a subscriber PC has a
+// stable browser exchange. Connected PCs are ready; a connecting PC is also
+// ready once its browser offer has been answered. A brand-new PC must wait so
+// an automatic server offer cannot overtake the browser's initial offer.
+func (h *Handler) subscriberReadyForAutomaticAttach(pc *webrtc.PeerConnection) bool {
+	if pc == nil {
+		return false
+	}
+	if pc.State() == webrtc.PeerConnectionStateConnected {
+		return true
+	}
+	if pc.State() == webrtc.PeerConnectionStateClosed || pc.State() == webrtc.PeerConnectionStateFailed {
+		return false
+	}
+	pionPC := pc.PionPeerConnection()
+	return pionPC != nil && pionPC.RemoteDescription() != nil && pionPC.SignalingState() == pionwebrtc.SignalingStateStable
+}
+
+// attachSubscribedReadyTracks flushes subscriptions that were recorded while
+// a participant's initial browser offer was in flight. It is called after the
+// browser offer is answered; only authoritative remote-backed forwarders are
+// attached, so no provisional codec can enter the subscriber SDP.
+func (h *Handler) attachSubscribedReadyTracks(room *domain.Room, subscriber *domain.Participant) {
+	if room == nil || subscriber == nil {
+		return
+	}
+	pc := h.getPeerConnection(subscriber.ID())
+	if !h.subscriberReadyForAutomaticAttach(pc) {
+		return
+	}
+	for _, trackID := range subscriber.SubscribedTracks() {
+		track := room.GetTrack(trackID)
+		if track == nil || track.Publisher() == nil || track.Publisher().ID() == subscriber.ID() {
+			continue
+		}
+		fw := h.getForwarder(trackID)
+		if fw == nil || fw.PublisherTrack() == nil || !fw.PublisherTrack().IsRemote() {
+			continue
+		}
+		alreadyAttached := fw.HasSubscriber(pc)
+		if err := fw.AddSubscriber(pc); err != nil {
+			h.logger.Warn("deferred subscriber attach failed",
+				"event", "deferred_subscriber_attach_failed",
+				"track_id", trackID,
+				"publisher_id", track.Publisher().ID(),
+				"subscriber_id", subscriber.ID(),
+				"error", err,
+			)
+			continue
+		}
+		if !alreadyAttached {
+			h.logger.Info("deferred subscriber attached",
+				"event", "deferred_subscriber_attached",
+				"track_id", trackID,
+				"publisher_id", track.Publisher().ID(),
+				"subscriber_id", subscriber.ID(),
+			)
+			go pc.RequestSubscriberOffer()
+		}
+	}
 }
 
 // handleUnpublishTrack handles an unpublish track request.
@@ -1012,6 +1449,11 @@ func (h *Handler) handleSubscribeTrack(conn *Connection, room *domain.Room, part
 	if err := msg.UnmarshalData(&req); err != nil {
 		return err
 	}
+	h.logger.Info("subscribe request",
+		"event", "subscribe_request",
+		"participant_id", participant.ID(),
+		"track_id", req.TrackID,
+	)
 
 	// Subscribe through the room registry: the room owns track lookup and
 	// keeps subscriber bookkeeping consistent for the whole room. Domain
@@ -1019,6 +1461,13 @@ func (h *Handler) handleSubscribeTrack(conn *Connection, room *domain.Room, part
 	// the generic message loop.
 	if err := room.SubscribeToTrack(participant, req.TrackID); err != nil {
 		return err
+	}
+	subscribedTrack := participant.GetSubscribedTrack(req.TrackID)
+	publisherID := ""
+	if subscribedTrack != nil {
+		if publisher := subscribedTrack.Publisher(); publisher != nil {
+			publisherID = publisher.ID()
+		}
 	}
 
 	// SFU wiring: add subscriber PC to forwarder.
@@ -1059,19 +1508,108 @@ func (h *Handler) handleSubscribeTrack(conn *Connection, room *domain.Room, part
 		_ = participant.UnsubscribeTrack(req.TrackID)
 		return webrtc.ErrTrackNotReady
 	}
+	// Any live subscriber can wait for the publisher's real TrackRemote.
+	// Attaching the placeholder here would negotiate a guessed codec (VP8 for
+	// video); when the publisher later arrives as H264 the egress sender has to
+	// be removed and recreated, which browsers observe as a duplicate remote
+	// track and may leave muted with no RTP. Keep the domain subscription, then
+	// attach the authoritative egress after the browser exchange is stable.
+	if deferred, reason := h.shouldDeferProvisionalSubscription(req.TrackID, fw, subPC); deferred {
+		h.logger.Info("subscription deferred until publisher track is ready",
+			"event", "subscription_deferred",
+			"track_id", req.TrackID,
+			"publisher_id", publisherID,
+			"subscriber_id", participant.ID(),
+			"reason", reason,
+		)
+		resp := TrackSubscribedResponse{
+			TrackID:     req.TrackID,
+			PublisherID: publisherID,
+			Status:      "success",
+		}
+		return conn.Send(MessageTypeTrackSubscribed, resp)
+	}
+	alreadyAttached := fw.HasSubscriber(subPC)
 	if err := fw.AddSubscriber(subPC); err != nil {
 		_ = participant.UnsubscribeTrack(req.TrackID)
 		return err
 	}
+	// Sync drive: push the subscriber offer through the negotiation gate so a
+	// first subscription never depends solely on pion's asynchronous
+	// negotiation-needed callback (pion aborts that callback when the PC is
+	// not stable, and its chain-empty re-drive is timing-dependent). Run off
+	// the message loop: the gate's offer waits for ICE gathering, which must
+	// never stall this participant's message processing. When the gate is
+	// closed the need stays coalesced in pendingNegotiation and the
+	// completion paths flush exactly one offer; the generation guard
+	// deduplicates the async echo of the same AddTrack.
+	if !alreadyAttached {
+		go subPC.RequestSubscriberOffer()
+	}
+	// Ask the publisher encoder for a fresh keyframe now that a subscriber
+	// is attached (no-op until the real TrackRemote exists). This shortens
+	// time-to-first-decodable-frame; the subscriber-PLI relay covers the
+	// steady state.
+	h.requestUpstreamKeyframe(req.TrackID)
 
 	// Send response
 	resp := TrackSubscribedResponse{
 		TrackID:     req.TrackID,
-		PublisherID: req.ParticipantID,
+		PublisherID: publisherID,
 		Status:      "success",
 	}
 
 	return conn.Send(MessageTypeTrackSubscribed, resp)
+}
+
+// shouldDeferProvisionalSubscription reports whether a connected subscriber
+// should wait for the publisher's real remote track instead of attaching the
+// eager placeholder forwarder. Domain-only tests and server-local publishers
+// intentionally retain the legacy provisional path; they have no browser
+// publisher exchange from which an OnTrack callback can complete the attach.
+func (h *Handler) shouldDeferProvisionalSubscription(trackID string, fw *webrtc.TrackForwarder, subPC *webrtc.PeerConnection) (bool, string) {
+	if fw == nil || subPC == nil || !subPC.State().Usable() {
+		return false, ""
+	}
+	// Before the subscriber's first browser offer has been answered, the
+	// provisional track is still needed to describe the subscription in that
+	// initial negotiation. Once that exchange has started, wait for the
+	// publisher's authoritative TrackRemote instead of attaching a placeholder
+	// that can later produce a duplicate media section.
+	if subPC.State() != webrtc.PeerConnectionStateConnected {
+		pionSubscriber := subPC.PionPeerConnection()
+		if pionSubscriber == nil || pionSubscriber.RemoteDescription() == nil {
+			return false, ""
+		}
+	}
+	publisherTrack := fw.PublisherTrack()
+	if publisherTrack == nil || publisherTrack.IsRemote() {
+		return false, ""
+	}
+	domainTrack := publisherTrack.DomainTrack()
+	if domainTrack == nil || domainTrack.Publisher() == nil {
+		return false, ""
+	}
+	publisherPC := h.getPeerConnection(domainTrack.Publisher().ID())
+	if publisherPC == nil {
+		return false, ""
+	}
+	// A local server track already has its authoritative source on the
+	// publisher PC and must not wait for an OnTrack callback.
+	if publisherPC.GetLocalTrack(trackID) != nil {
+		return false, "publisher_local_track"
+	}
+	pionPC := publisherPC.PionPeerConnection()
+	if pionPC == nil {
+		return false, ""
+	}
+	if pionPC.LocalDescription() != nil || pionPC.RemoteDescription() != nil {
+		return true, "publisher_description_set"
+	}
+	if pionPC.SignalingState() != pionwebrtc.SignalingStateStable {
+		return true, "publisher_signaling_not_stable"
+	}
+	return false, ""
 }
 
 // handleUnsubscribeTrack handles an unsubscribe track request.
@@ -1138,20 +1676,52 @@ func (h *Handler) handleOffer(conn *Connection, room *domain.Room, participant *
 		return nil
 	}
 
-	// CreateAnswer installs the remote offer before generating the answer.
-	answer, err := pc.CreateAnswer(offer)
+	// ProcessBrowserOffer runs the inbound answer unit through the
+	// per-PC negotiation gate: stable offers are answered inline; an offer
+	// arriving behind our own outstanding subscriber offer is stored and
+	// answered once stable (deferred, never InvalidModificationError).
+	answer, deferred, err := pc.ProcessBrowserOffer(offer)
 	if err != nil {
 		h.sendWebRTCError(conn, msg.Type, err)
 		return nil
 	}
+	if deferred {
+		// No error and no answer yet: the stored offer is answered with
+		// priority when the PC returns to stable (delivered as
+		// webrtc:answer over the participant's signaling sender).
+		h.logger.Debug("browser offer deferred behind server negotiation",
+			"event", "webrtc_offer_deferred",
+			"participant_id", conn.ID(),
+			"target", req.TargetParticipantID,
+			"pc", pc.InstanceID(),
+		)
+		return nil
+	}
+	// DIAG-PCID: bind the answered offer to the exact PC object.
+	h.logger.Debug("offer applied, answer generated",
+		"event", "webrtc_offer_applied",
+		"participant_id", conn.ID(),
+		"target", req.TargetParticipantID,
+		"pc", pc.InstanceID(),
+		"sdp", webrtc.SDPSummary(answer.SDP()),
+	)
 
-	// Send the answer back to the source participant
+	// Send the answer back to the source participant. Deferred negotiation
+	// (stored browser offer, coalesced subscriber offer) is flushed only
+	// after the answer is enqueued on this connection's FIFO send channel,
+	// so the browser never receives an offer that overtakes the answer to
+	// its own publisher offer.
 	answerNotification := AnswerNotification{
 		SourceParticipantID: req.TargetParticipantID,
 		SDP:                 answer.SDP(),
 	}
 
-	return conn.Send(MessageTypeAnswer, answerNotification)
+	if err := conn.Send(MessageTypeAnswer, answerNotification); err != nil {
+		return err
+	}
+	h.attachSubscribedReadyTracks(room, target)
+	pc.FlushDeferredNegotiation()
+	return nil
 }
 
 // handleAnswer handles a WebRTC answer by installing it as the remote
@@ -1183,11 +1753,60 @@ func (h *Handler) handleAnswer(conn *Connection, room *domain.Room, participant 
 		return nil
 	}
 
-	// Set the remote description on the source peer connection
-	if err := pc.SetRemoteDescription(answer); err != nil {
+	// Set the remote description on the target peer connection through the
+	// negotiation gate (stable after applying; deferred work flushes).
+	// LiveKit-style idempotency: duplicate answer while stable (retransmit)
+	// is ignored instead of returning internal_error.
+	if err := pc.ProcessBrowserAnswer(answer); err != nil {
+		if errors.Is(err, webrtc.ErrNoPendingOffer) {
+			// Check if already have same remote SDP (duplicate)
+			if rd := pc.PionPeerConnection().RemoteDescription(); rd != nil && rd.SDP == answer.SDP() {
+				h.logger.Debug("duplicate answer ignored (stable)",
+					"event", "duplicate_answer_ignored",
+					"participant_id", conn.ID(),
+					"target", req.TargetParticipantID,
+				)
+				return nil
+			}
+			// Also ignore if already stable and answer is same as local? treat as idempotent.
+			// Warn (not Debug): a non-matching answer on a stable PC with no
+			// pending offer is almost always a mis-targeted answer (wrong
+			// target_participant_id, e.g. answering the publisher instead of
+			// the subscriber's own PC). Silent swallowing hid exactly that
+			// client bug in production (2026-09-04), so make it visible.
+			h.logger.Warn("answer on stable ignored",
+				"event", "answer_on_stable_ignored",
+				"participant_id", conn.ID(),
+				"target", req.TargetParticipantID,
+				"hint", "answer matched no pending offer; check target_participant_id",
+				"error", err,
+			)
+			return nil
+		}
+		// Live-debug aid: the browser's own answer is the ground truth for
+		// bind failures (ErrUnsupportedCodec) — log which codecs it chose.
+		h.logger.Warn("browser answer rejected",
+			"event", "webrtc_answer_rejected",
+			"participant_id", conn.ID(),
+			"target", req.TargetParticipantID,
+			"pc", pc.InstanceID(),
+			"sdp", webrtc.SDPSummary(answer.SDP()),
+			"error", err,
+		)
 		h.sendWebRTCError(conn, msg.Type, err)
 		return nil
 	}
+	// DIAG-E2E: one-line answer summary so a live test can compare the
+	// browser answer against the SFU subscriber offer (codecs/PT/direction).
+	// DIAG-PCID: pc binds the answer to the exact object that installed it.
+	h.logger.Info("webrtc answer applied",
+		"event", "webrtc_answer_applied",
+		"participant_id", conn.ID(),
+		"target", req.TargetParticipantID,
+		"pc", pc.InstanceID(),
+		"sdp", webrtc.SDPSummary(answer.SDP()),
+	)
+	h.attachSubscribedReadyTracks(room, room.GetParticipant(req.TargetParticipantID))
 	return nil
 }
 
@@ -1228,6 +1847,17 @@ func (h *Handler) handleICECandidate(conn *Connection, room *domain.Room, partic
 		h.sendWebRTCError(conn, msg.Type, err)
 		return nil
 	}
+	// DIAG-E2E: proves which PC a client candidate was actually applied to —
+	// the decisive check for mis-targeted subscriber ICE (target must be the
+	// subscriber's own PC, i.e. the source of the server offer).
+	h.logger.Debug("ice candidate applied",
+		"event", "ice_candidate_applied",
+		"participant_id", conn.ID(),
+		"target", req.TargetParticipantID,
+		"pc", pc.InstanceID(),
+		"sdp_mid", req.SDPMid,
+		"sdp_mline_index", req.SDPMLineIndex,
+	)
 	return nil
 }
 
@@ -1400,10 +2030,42 @@ func (h *Handler) sendRoomJoined(conn *Connection, room *domain.Room, participan
 		RoomID:        room.ID(),
 		ParticipantID: participant.ID(),
 		Participants:  participants,
+		Tracks:        h.publishedTracksForJoiner(room, participant.ID()),
 		Status:        "success",
 	}
 
 	return conn.Send(MessageTypeRoomJoined, resp)
+}
+
+// publishedTracksForJoiner snapshots the room's authoritative published-track
+// registry for a joining participant (late-joiner discovery). It returns one
+// entry per published track owned by OTHER participants: the joiner's own
+// tracks are excluded, and unpublished tracks never appear (UnpublishTrack
+// removes them from the registry; state is re-checked defensively).
+// Tracks without a resolvable publisher are skipped — there is no upstream
+// RTCP/RTP path for them. Read-only; takes no handler locks beyond the
+// room's own RLock discipline.
+func (h *Handler) publishedTracksForJoiner(room *domain.Room, joinerID string) []PublishedTrackInfo {
+	tracks := make([]PublishedTrackInfo, 0)
+	for _, trackID := range room.Tracks() {
+		track := room.GetTrack(trackID)
+		if track == nil || track.State() != domain.TrackStatePublished {
+			continue
+		}
+		pub := track.Publisher()
+		if pub == nil || pub.ID() == "" || pub.ID() == joinerID {
+			continue
+		}
+		tracks = append(tracks, PublishedTrackInfo{
+			ParticipantID: pub.ID(),
+			Track: TrackInfo{
+				ID:     track.ID(),
+				Kind:   track.Kind().String(),
+				Source: track.Source().String(),
+			},
+		})
+	}
+	return tracks
 }
 
 // broadcastParticipantJoined broadcasts a participant joined notification to all other participants in the room.

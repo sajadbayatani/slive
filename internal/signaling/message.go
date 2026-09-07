@@ -119,7 +119,20 @@ type RoomJoinedResponse struct {
 	RoomID        string            `json:"room_id"`
 	ParticipantID string            `json:"participant_id"`
 	Participants  []ParticipantInfo `json:"participants"`
-	Status        string            `json:"status"`
+	// Tracks lists tracks already published in the room at join time, so a
+	// late joiner discovers existing tracks without waiting for
+	// track_available broadcasts it already missed. The joiner's own tracks
+	// are excluded. Empty (not null) when nothing is published.
+	Tracks []PublishedTrackInfo `json:"tracks"`
+	Status string               `json:"status"`
+}
+
+// PublishedTrackInfo describes one already-published track for late-joiner
+// discovery. It carries exactly what subscribe_track needs, plus the owning
+// publisher: no internal WebRTC/Pion details are exposed.
+type PublishedTrackInfo struct {
+	ParticipantID string    `json:"participant_id"`
+	Track         TrackInfo `json:"track"`
 }
 
 // ParticipantJoinedNotification represents a notification that a participant has joined.
@@ -333,8 +346,13 @@ func errorCodeFromError(err error) string {
 
 // WebRTC message validation constants.
 const (
-	MaxSDPLength       = 16384 // Maximum SDP length in bytes
-	MaxCandidateLength = 1024  // Maximum ICE candidate length in bytes
+	// A single unified-plan PeerConnection carries the participant's local
+	// tracks plus one pair of transceivers per subscribed remote track. With
+	// three or more participants, browser SDP commonly exceeds 16 KiB before
+	// ICE/codec details are complete. Keep a bounded limit, but leave room for
+	// normal multiparty negotiation.
+	MaxSDPLength       = 64 * 1024 // Maximum SDP length in bytes
+	MaxCandidateLength = 1024      // Maximum ICE candidate length in bytes
 )
 
 // Convert domain errors to signaling error codes.

@@ -2,6 +2,7 @@ package signaling
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/sajadbayatani/slive/internal/domain"
@@ -370,6 +371,35 @@ func TestValidateAnswerRequest(t *testing.T) {
 				t.Errorf("ValidateAnswerRequest() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestValidateSDPAllowsMultipartyDescription(t *testing.T) {
+	// A unified-plan three-party description can exceed the old 16 KiB limit.
+	// Validation should still reject values beyond the bounded protocol limit.
+	largeSDP := "v=0\r\n" + strings.Repeat("a", 32*1024)
+
+	offer := &OfferRequest{
+		ParticipantID:       "participant1",
+		TargetParticipantID: "participant1",
+		SDP:                 largeSDP,
+	}
+	if err := ValidateOfferRequest(offer); err != nil {
+		t.Fatalf("ValidateOfferRequest rejected multiparty SDP: %v", err)
+	}
+
+	answer := &AnswerRequest{
+		ParticipantID:       "participant1",
+		TargetParticipantID: "participant1",
+		SDP:                 largeSDP,
+	}
+	if err := ValidateAnswerRequest(answer); err != nil {
+		t.Fatalf("ValidateAnswerRequest rejected multiparty SDP: %v", err)
+	}
+
+	offer.SDP = strings.Repeat("a", MaxSDPLength+1)
+	if err := ValidateOfferRequest(offer); err == nil {
+		t.Fatal("ValidateOfferRequest accepted SDP above the protocol limit")
 	}
 }
 
