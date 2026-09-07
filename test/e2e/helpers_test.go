@@ -138,6 +138,40 @@ func (c *wsClient) expectSilence(what string, window time.Duration) {
 	}
 }
 
+// drainUntilQuiet discards stray messages (late server→client ICE trickle
+// from earlier exchanges) until a full quiet window elapses. The fire-and-
+// forget silence assertions that follow only hold once the socket has
+// settled: without this, a delayed candidate push from a previous step can
+// land inside the assertion window on slow runners and flake the test.
+// Bounded by budget; fails only if the socket never settles.
+func (c *wsClient) drainUntilQuiet(what string, quiet, budget time.Duration) {
+	c.t.Helper()
+
+	deadline := time.Now().Add(budget)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			c.t.Fatalf("%s: socket never settled within %s", what, budget)
+		}
+		window := quiet
+		if remaining < window {
+			window = remaining
+		}
+		if err := c.conn.SetReadDeadline(time.Now().Add(window)); err != nil {
+			c.t.Fatalf("SetReadDeadline (%s): %v", what, err)
+		}
+		_, data, err := c.conn.ReadMessage()
+		if err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				return // full quiet window elapsed: settled
+			}
+			c.t.Fatalf("%s: drain read failed: %v", what, err)
+		}
+		c.t.Logf("%s: drained stray message while settling: %s", what, data)
+	}
+}
+
 // waitFor polls cond until it holds or the timeout expires.
 func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
 	t.Helper()

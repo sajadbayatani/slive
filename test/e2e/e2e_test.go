@@ -165,6 +165,10 @@ func TestTwoParticipantsControlPlaneFlow(t *testing.T) {
 
 	// 7. Client→server ICE forwarding: Bob targets Alice's peer connection;
 	// acceptance is silent — any failure would produce an error response.
+	// Settle Bob's socket first: candidate pushes from step 5's exchange can
+	// still be trickling on slow runners, and only a settled socket makes
+	// the silence assertion that follows meaningful.
+	bob.drainUntilQuiet("bob pre-forwarding settle", 250*time.Millisecond, 10*time.Second)
 	bob.send(signaling.MessageTypeICECandidate, signaling.ICECandidateRequest{
 		RoomID:              "e2e-room",
 		ParticipantID:       "p-bob",
