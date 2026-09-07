@@ -1,0 +1,63 @@
+# Local WebRTC TURN relay for Slive (coturn).
+#
+# Gives browsers and Slive a relay fallback so NAT / WireGuard / hairpin and
+# Docker-bridge reachability issues stop being ICE blockers. UDP first; TCP
+# listener is allocation fallback only.
+#
+# Required environment (see .env.example — never commit real secrets):
+#   TURN_USERNAME   static TURN user
+#   TURN_PASSWORD   static TURN password (compose refuses to start without it)
+# Optional:
+#   TURN_REALM      coturn realm, default slive.local
+#
+# Start:   TURN_USERNAME=slive TURN_PASSWORD=<secret> docker compose up -d coturn
+# Logs:    docker compose logs -f coturn   (look for "allocate" on first call)
+# Stop:    docker compose down
+#
+# Slive (native or containerized) picks the relay up via:
+#   TURN_SERVER=turn:<reachable-host>:3478 TURN_USERNAME=... TURN_PASSWORD=...
+# where <reachable-host> is an IP/hostname the BROWSERS can reach
+# (same-laptop browsers: your LAN IP or hostname; NOT a Docker container IP
+# on Docker Desktop, which browsers cannot route to).
+services:
+  coturn:
+    image: coturn/coturn:4.6.3
+    container_name: slive-coturn
+    networks:
+      - slive-network
+    restart: unless-stopped
+    volumes:
+      - ./deploy/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    # --user/--realm come from the environment so no secret lives in the repo.
+    # The :? guards fail fast with a clear message instead of a broken relay.
+    command:
+      - -c
+      - /etc/coturn/turnserver.conf
+      - --realm=${TURN_REALM:-slive.local}
+      - --user=${TURN_USERNAME:?TURN_USERNAME is required}:${TURN_PASSWORD:?TURN_PASSWORD is required}
+    ports:
+      - "3478:3478/udp" # TURN allocations (UDP first)
+      - "3478:3478/tcp" # allocation fallback
+      - "49160-49170:49160-49170/udp" # relay media window (must match min/max-port)
+
+  slive:
+    image: slive:dev
+    networks:
+      - slive-network
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      # DIAG-TURN: pass the TURN relay config through so the containerized
+      # server gathers relay candidates like a native run does. Values come
+      # from the shell or .env (see TURN_SERVER there); empty means "no
+      # relay", which the ice_turn_config startup log will show explicitly.
+      TURN_SERVER: "${TURN_SERVER:-}"
+      TURN_USERNAME: "${TURN_USERNAME:-}"
+      TURN_PASSWORD: "${TURN_PASSWORD:-}"
+      TURN_REALM: "${TURN_REALM:-slive.local}"
+
+
+networks:
+  slive-network:
+    external: true
