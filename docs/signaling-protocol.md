@@ -4,7 +4,9 @@
 
 The Slive signaling protocol enables real-time session negotiation between participants in a room. It uses a request-response pattern over WebSocket connections to exchange signaling messages for WebRTC session establishment.
 
-This document provides the complete specification of the signaling protocol as implemented in Sprint 01, including message formats, state machines, and integration details with the core domain model.
+This document provides the complete specification of the signaling protocol as
+implemented in the current `v0.9.0` release, including message formats, state
+machines, late-join track discovery, and WebRTC/SFU integration details.
 
 ---
 
@@ -619,16 +621,12 @@ go test ./internal/signaling/... -run TestRoomManager_CreateRoom
 
 ## Future Enhancements
 
-The following features are planned for future sprints:
+The following features remain planned for future releases:
 
 1. **Authentication**: Replace query parameter auth with proper JWT or token-based auth
 2. **Authorization**: Implement room access control and permissions
-3. **SFU Integration**: Add Selective Forwarding Unit for media routing
-4. **Reconnection**: Implement automatic reconnection with session recovery
-5. **Heartbeat**: Add connection keep-alive mechanism
-6. **Metrics**: Add protocol metrics and monitoring
-7. **Rate Limiting**: Implement message rate limiting per connection
-8. **Message Validation**: Add schema validation for incoming messages
+3. **Rate Limiting**: Implement message rate limiting per connection
+4. **Schema tooling**: Add generated schema validation for incoming messages
 
 ---
 
@@ -637,4 +635,3 @@ The following features are planned for future sprints:
 - [WebSocket Protocol (RFC 6455)](https://datatracker.ietf.org/doc/html/rfc6455)
 - [WebRTC Specification](https://webrtc.org/specification/)
 - [Gorilla WebSocket](https://github.com/gorilla/websocket)
-- [LiveKit Architecture](https://github.com/livekit/livekit) - Inspiration for architecture

@@ -308,7 +308,7 @@ All three are STUN-free, exit 0, and finish in under 5 seconds. See
 - [docs/sdk.md](docs/sdk.md) — exported surface table (types, methods, options, error sentinels).
 - [pkg/slive doc.go](pkg/slive/doc.go) — the package contract, also via `go doc -all ./pkg/slive`.
 - [VERSIONING.md](VERSIONING.md) — SemVer rules, deprecation policy, stable vs unstable surface.
-- [CHANGELOG.md](CHANGELOG.md) — released versions; current SDK surface is `0.7.0`.
+- [CHANGELOG.md](CHANGELOG.md) — released versions; current release is `v0.9.0`.
 
 ---
 

@@ -8,15 +8,17 @@ interpreted for a pre-1.0 module by [`VERSIONING.md`](VERSIONING.md): the
 any release, and while the major version is `0` a MINOR may break with a
 `Breaking` section and migration snippets.
 
-Versions track sprints: `0.7.x` is sprint-07 (SDK/API maturity), `0.6.x` is
-sprint-06 (single-node scale), and so on.
-
-No tag exists in the repository yet, so `0.7.0` is the first version to be
-tagged; the `0.6.0` and earlier entries below are retroactive history seeded
-from the sprint reports and `state/STATE.yaml`, not previously published
-releases.
+Versions track sprints: `0.9.x` is the current media-path and reliability
+line, `0.8.x` is release and distribution, `0.7.x` is SDK/API maturity, and
+earlier entries are retroactive sprint history.
 
 ## [Unreleased]
+
+No unreleased changes are recorded yet.
+
+---
+
+## [0.9.0] — 2026-09-07 (alpha release 1)
 
 ### Added
 
@@ -63,6 +65,15 @@ releases.
   with `//go:build slive_internal`. Unexported `reapGhost`/`armGhostTimer`/`resetMetrics`
   remain tagless for in-package tests. `Client.Handler()` now carries `// Deprecated:` pointing to
   `HTTPHandler`/`Connect`/`RoomIDs`/`CloseRoom`.
+* **SFU media-path hardening:** late joiners receive already-published track
+  metadata, publisher media is relayed to subscribers, and subscriber PLI/FIR
+  feedback is routed back to the publisher for faster keyframe convergence.
+* **Negotiation and lifecycle regression coverage:** added conformance tests for
+  multi-party ordering, offer glare, duplicate room creation, PeerConnection
+  identity, codec/extmap reconciliation, reconnects, and bidirectional media.
+* **Local TURN support:** added the coturn Docker Compose service, preferred
+  `TURN_SERVER`/`TURN_PASSWORD` configuration names, and startup diagnostics
+  that report effective ICE/TURN settings without exposing credentials.
 
 ### Changed
 
@@ -74,9 +85,18 @@ releases.
 * `docs/sdk.md` §3 adds `RoomIDs`/`CloseRoom` (S) rows and deprecates `Handler()`; §7
   monotonicity caveat updated to gated hooks. `VERSIONING.md` §5 adds `RoomIDs`/`CloseRoom`
   to stable surface; §6 notes hooks gated. `pkg/slive/doc.go` stable list updated.
+* The signaling SDP limit is 64 KiB to support normal multi-party Unified Plan
+  negotiation, and CI serializes timing-sensitive test packages to reduce flakes.
 
-Nothing else staged. Open items carried into the next sprint are listed under
-each release's **Known issues**.
+### Fixed
+
+* Late-join discovery no longer misses tracks published before the participant
+  connected.
+* Negotiation races and asynchronous Pion callbacks no longer leave the media
+  path waiting on stale offers or answers.
+
+Open items carried into the next sprint are listed under each release's
+**Known issues**.
 
 ---
 
@@ -342,6 +362,8 @@ Prior release; no public Go API existed. Included for continuity.
 * Configuration and structured logging infrastructure (`cmd/slive`).
 
 [Unreleased]: #unreleased
+[0.9.0]: #090--2026-09-07-alpha-release-1
+[0.8.0]: #080--2026-09-01-sprint-09-release--distribution-pipeline
 [0.7.0]: #070--2026-08-31-sprint-07-sdk-and-api-maturity
 [0.6.0]: #060--2026-08-31-sprint-06-single-node-scale-and-capacity
 [0.5.0]: #050--2026-08-31-sprint-05-observability-foundation

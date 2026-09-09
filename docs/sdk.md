@@ -423,7 +423,7 @@ now return `ErrClientClosed`, and missing `roomID`/`participantID` returns
   previous "recorded, not applied" note is obsolete as of sprint-08. Remains:
   bounded-drop semantics (TASK-022) unchanged.
 * **No RTP injection from the SDK (intentional).** The `TrackForwarder` type
-  and its `WriteRTP` method are not exported on the `0.7.0` surface, so no
+  and its `WriteRTP` method are not exported on the current `v0.9.0` surface, so no
   `pkg/slive` symbol can push a synthetic RTP burst. TASK-032's brief asked for
   a 10-packet burst in the `publish-subscribe` example; instead the example
   asserts `forwarder_subscribers >= 1` and that `forwarder_dropped_total` is
@@ -432,7 +432,7 @@ now return `ErrClientClosed`, and missing `roomID`/`participantID` returns
   `test/scale`. Rationale: exporting the forwarder now would freeze a type
   whose locking and pooling design changed in sprint-06. This is a stability
   trade-off recorded for architect sign-off
-  (`CHANGELOG.md` [0.7.0], `reports/sprint-07-architecture.md`), not an
+  (`CHANGELOG.md` [0.7.0]), not an
   oversight. Exporting it later is a MINOR; the SDK path for media will be
   `Session` (or a future typed media handle), not a raw forwarder.
 * **Domain-only publish does not create a forwarder.** `Client.PublishTrack`
@@ -490,4 +490,3 @@ in this document.
 [`CHANGELOG.md`](../CHANGELOG.md) ·
 [`docs/architecture.md`](architecture.md) ·
 [`docs/signaling-protocol.md`](signaling-protocol.md) ·
-[`reports/sprint-07-architecture.md`](../reports/sprint-07-architecture.md)

@@ -4,7 +4,7 @@ This document describes how Slive releases are cut, published to GitHub Releases
 
 ## Trigger
 
-- **Tag push:** `git tag v0.8.0 && git push origin v0.8.0` triggers `.github/workflows/release.yml` (`on: push: tags: ['v*']`).
+- **Tag push:** `git tag v0.9.0 && git push origin v0.9.0` triggers `.github/workflows/release.yml` (`on: push: tags: ['v*']`).
 - **Manual dry-run:** `workflow_dispatch` with `dry_run: true` runs `validate` + `build` but skips `release` and `docker` jobs (`if: ${{ !inputs.dry_run }}`).
 
 Releases are only created on annotated tags `v*`. Branch pushes do not publish.
@@ -201,12 +201,12 @@ Copy this checklist for each release (all commands with `GOMODCACHE="$PWD/.gocac
 - [ ] race pass (`go test -tags slive_internal ./... -race -count=1` and `go test ./... -race -count=1` clean)
 - [ ] build pass (`go build ./...` and `make build` / `make dist`)
 - [ ] coverage generated (`make cover` produces `coverage.out` and `go tool cover -func=coverage.out` succeeds)
-- [ ] version tag created (`git tag v0.8.0 && git push origin v0.8.0`; tag is annotated, `v*` triggers release)
+- [ ] version tag created (`git tag v0.9.0 && git push origin v0.9.0`; tag is annotated, `v*` triggers release)
 - [ ] GitHub Release created (workflow `release` job, `softprops/action-gh-release@v2`, `generate_release_notes: true`)
 - [ ] binaries uploaded (matrix `linux/darwin × amd64/arm64` tars `dist/slive_<version>_<goos>_<goarch>.tar.gz`)
 - [ ] checksums uploaded (`dist/checksums.txt` via `sha256sum` / `shasum -a 256`)
 - [ ] Docker image published (`sajadbayatani/slive` via `docker/build-push-action@v6`, `push: true`)
-- [ ] Docker tag matches Git tag (verify `docker inspect` label `org.opencontainers.image.version == v0.8.0` and semver shorthand `0.8.0/0.8/0/latest`)
+- [ ] Docker tag matches Git tag (verify `docker inspect` label `org.opencontainers.image.version == v0.9.0` and semver shorthand `0.9.0/0.9/0/latest`)
 - [ ] README badges updated automatically (CI, Coverage, Release, Docker badges point to official `shields.io`/`github`/`hub.docker.com` URLs)
 - [ ] traceability verified (`git tag → commit → image → binary`: `slive --version` commit matches `github.sha` and `org.opencontainers.image.revision`)
 

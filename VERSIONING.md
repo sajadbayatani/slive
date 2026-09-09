@@ -4,8 +4,7 @@
 [`pkg/slive`](pkg/slive) (import path
 `github.com/sajadbayatani/slive/pkg/slive`), the signalling/health wire formats
 that surface depends on, and the released module versions.
-**Status:** active, ratified by the sprint-07 architecture report
-(`reports/sprint-07-architecture.md`, decisions D1–D4).
+**Status:** active, ratified with the sprint-07 SDK decisions D1–D4.
 
 This policy is human-readable and manually enforced. There is no automated
 breaking-change detector; the enforcement points are the tests in
@@ -20,7 +19,7 @@ Slive ships one Go module (`github.com/sajadbayatani/slive`) with tags
 module, a consumer installs it as
 
 ```bash
-go get github.com/sajadbayatani/slive/pkg/slive@v0.7.0
+go get github.com/sajadbayatani/slive/pkg/slive@v0.9.0
 ```
 
 The **compatibility promise is `pkg/slive` only.** The module also contains
@@ -28,14 +27,12 @@ The **compatibility promise is `pkg/slive` only.** The module also contains
 move at the same version number but carry no compatibility promise — see
 [§6](#6-unstable-surface).
 
-Slive is pre-1.0. The current release line is `0.7.x`, where the minor number
-tracks the sprint that produced it (`0.7.0` = sprint-07).
+Slive is pre-1.0. The current release line is `0.9.x`; the minor number tracks
+the sprint or release line that produced it (`0.9.0` is the current alpha).
 
-No tag exists in the repository yet, so `v0.7.0` is the **first** release to be
-cut (see the checklist in [§8](#8-release-checklist)); the `0.1.0`–`0.6.0`
-entries in `CHANGELOG.md` are retroactive labels for sprints 01–06, not
-previously published versions. Nothing has been consumed from a tag yet, so
-this policy binds from `v0.7.0` forward.
+`v0.7.0`, `v0.8.0`, and `v0.9.0` are published tags. The `0.1.0`–`0.6.0`
+entries in `CHANGELOG.md` remain retroactive labels for sprints 01–06, not
+previously published versions.
 
 ---
 
@@ -283,13 +280,13 @@ go vet ./pkg/slive/... ./examples/...       # stdlib vet checks (the alias bound
 go build ./pkg/slive/... ./examples/...
 gofmt -l pkg/slive examples test/sdk        # must print nothing
 go test ./... -race -count=1                # full regression
-git tag -a v0.7.0 -m "slive v0.7.0: stable pkg/slive SDK surface"
+git tag -a v0.9.0 -m "slive v0.9.0: media path and reliability hardening"
 ```
 
-Then: `CHANGELOG.md` has a `## [0.7.0]` section with `Added` / `Changed` /
+Then: `CHANGELOG.md` has a `## [0.9.0]` section with `Added` / `Changed` /
 `Deprecated` / `Removed` / `Fixed` / `Breaking` headings, the stable list in
-this file matches `docs/sdk.md`, and `reports/sprint-NN-architecture.md`
-records anything the architect had to rule on.
+this file matches `docs/sdk.md`, and the release checklist records any
+release-specific decisions.
 
 ---
 
@@ -300,5 +297,3 @@ records anything the architect had to rule on.
 * [`CHANGELOG.md`](CHANGELOG.md) — per-release history and migration snippets.
 * [`examples/README.md`](examples/README.md) — runnable usage of the stable surface.
 * [`docs/signaling-protocol.md`](docs/signaling-protocol.md) — the wire format.
-* [`reports/sprint-07-architecture.md`](reports/sprint-07-architecture.md) — why
-  `pkg/slive` is the facade and what was deliberately left internal.

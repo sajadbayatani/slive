@@ -29,7 +29,7 @@ fails if any of them stops exiting 0 or stops printing the lines above.
 ## Not exercised here: the SFU `WriteRTP` burst
 
 The `TrackForwarder` type and its `WriteRTP` method are deliberately not
-exported on the `0.7.0` frozen surface, so no `pkg/slive` symbol can inject a
+exported on the `v0.9.0` stable surface, so no `pkg/slive` symbol can inject a
 synthetic RTP burst from outside `internal/*`. The burst stays covered by
 `internal/webrtc` and `test/scale` tests; the examples verify subscriber
 registration (`forwarder_subscribers`) and the monotonic
@@ -41,5 +41,5 @@ stability-over-convenience trade-off recorded for architect sign-off in
 
 - [SDK reference](../docs/sdk.md) — every exported symbol and its stability tier.
 - [Versioning policy](../VERSIONING.md) — what may and may not change.
-- [Changelog](../CHANGELOG.md) — the surface shipped in `0.7.0`.
+- [Changelog](../CHANGELOG.md) — the current `v0.9.0` surface and release history.
 - [README §Go SDK](../README.md#go-sdk-pkgslive) — install and minimal snippet.
